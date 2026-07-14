@@ -38,14 +38,23 @@ class SramToAxiBridge extends Module {
     }
     
     // 安全条件：警戒牌高悬期间，不接任何新客（读写全阻塞）
-    val safe_to_read  = !write_pending
+    // Do not launch an AR transaction in the same cycle that a new uncached
+    // write is accepted.  write_pending is registered, so checking it alone
+    // leaves a one-cycle hole in which AR and AW/W can start together.  The
+    // Chiplab simulation RAM can then accept the AR address but lose its R
+    // response, leaving the requesting cache permanently in Refill.
+    val safe_to_read  = !write_pending && !is_uncached_write
     val safe_to_write = !write_pending
 
     // =========================================================================
     // 状态机 1：读请求通道 (AR)
     // 任务：将 inst_sram 和 data_sram 的读请求仲裁后发送到 AR 通道
     // =========================================================================
-    val ar_idle :: ar_wait_ready :: Nil = Enum(2)
+    // Only one read transaction may be outstanding across the shared I/D
+    // bridge.  The caches each keep a single miss context, so releasing the
+    // bridge as soon as AR is accepted can let a second request overtake the
+    // first response and leave a cache waiting forever.
+    val ar_idle :: ar_wait_ready :: ar_wait_resp :: Nil = Enum(3)
     val ar_state = RegInit(ar_idle)
 
     val ar_grant_id = RegInit(0.U(4.W))
@@ -69,6 +78,12 @@ class SramToAxiBridge extends Module {
             ar_size_reg := io.inst_cache.rd_type // 正确做法：ICache 也会发 4.U(Burst) 或 2.U(Uncached)
         }
     } .elsewhen(ar_state === ar_wait_ready && io.axi.arready) {
+        // Some slaves can return a single-beat response in the AR handshake
+        // cycle; otherwise retain ownership until the final R beat arrives.
+        ar_state := Mux(io.axi.rvalid && io.axi.rready && io.axi.rlast,
+                        ar_idle, ar_wait_resp)
+    } .elsewhen(ar_state === ar_wait_resp &&
+                io.axi.rvalid && io.axi.rready && io.axi.rlast) {
         ar_state := ar_idle
     }
 

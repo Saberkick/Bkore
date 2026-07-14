@@ -3,11 +3,11 @@ package mycpu
 import chisel3._
 import chisel3.util._
 
-class mycpu_top extends RawModule {
+class core_top extends RawModule {
     // 龙芯 AXI 标准顶层时钟与复位命名
     val aclk    = IO(Input(Clock()))
     val aresetn = IO(Input(Bool()))
-    //val intrpt  = IO(Input(UInt(8.W)))
+    val intrpt  = IO(Input(UInt(8.W)))
 
     // ==========================================
     // 替换为 AXI 总线接口 (严格遵循表 8.4)
@@ -59,17 +59,17 @@ class mycpu_top extends RawModule {
     val bready  = IO(Output(Bool()))
 
     // trace debug interface
-    val debug_wb_pc       = IO(Output(UInt(32.W)))
-    val debug_wb_rf_we   = IO(Output(UInt(4.W))) // 注意这里是 wen
-    val debug_wb_rf_wnum  = IO(Output(UInt(5.W)))
-    val debug_wb_rf_wdata = IO(Output(UInt(32.W)))
+    val debug0_wb_pc       = IO(Output(UInt(32.W)))
+    val debug0_wb_rf_wen   = IO(Output(UInt(4.W))) // 注意这里是 wen
+    val debug0_wb_rf_wnum  = IO(Output(UInt(5.W)))
+    val debug0_wb_rf_wdata = IO(Output(UInt(32.W)))
 
     // 6. 附加 Debug 接口 (仅做占位，无需逻辑)
-    //val break_point = IO(Input(Bool()))
-    //val infor_flag  = IO(Input(Bool()))
-    //val reg_num     = IO(Input(UInt(5.W)))
-    //val ws_valid    = IO(Output(Bool()))
-    //val rf_rdata    = IO(Output(UInt(32.W)))
+    val break_point = IO(Input(Bool()))
+    val infor_flag  = IO(Input(Bool()))
+    val reg_num     = IO(Input(UInt(5.W)))
+    val ws_valid    = IO(Output(Bool()))
+    val rf_rdata    = IO(Output(UInt(32.W)))
 
     val reset_high = (!aresetn).asAsyncReset
 
@@ -162,7 +162,7 @@ class mycpu_top extends RawModule {
         ex_stage.io.mem_has_exc_in := mem_stage.io.mem_has_exc_out
 
         id_stage.io.has_int   := wb_stage.io.wb_has_int
-        wb_stage.io.hw_int_in := 0.U(8.W)
+        wb_stage.io.hw_int_in := intrpt
         ex_stage.io.timer_in  := timer.io.timer_out
 
         regfile.io.raddr1 := id_stage.io.rf_raddr1
@@ -285,15 +285,15 @@ class mycpu_top extends RawModule {
         bridge.io.axi.bvalid  := bvalid
         bready  := bridge.io.axi.bready
 
-        // 5. Debug 接口连线
-        debug_wb_pc       := wb_stage.io.debug_wb_pc
-        debug_wb_rf_we   := wb_stage.io.debug_wb_rf_we
-        debug_wb_rf_wnum  := wb_stage.io.debug_wb_rf_wnum
-        debug_wb_rf_wdata := wb_stage.io.debug_wb_rf_wdata
+        // 5. Debug 接口连线``
+        debug0_wb_pc       := wb_stage.io.debug_wb_pc
+        debug0_wb_rf_wen   := wb_stage.io.debug_wb_rf_we
+        debug0_wb_rf_wnum  := wb_stage.io.debug_wb_rf_wnum
+        debug0_wb_rf_wdata := wb_stage.io.debug_wb_rf_wdata
 
         // 附加 Debug 接口占位赋值
-        //ws_valid := false.B
-        //rf_rdata := 0.U
+        ws_valid := false.B
+        rf_rdata := 0.U
 
         // ==========================================
         // 终极调试探针：开机前 10 拍疯狂打印

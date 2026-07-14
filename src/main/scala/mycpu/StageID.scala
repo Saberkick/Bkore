@@ -85,6 +85,7 @@ class StageID extends Module {
     out_data.inst_ertn     := dec.inst_ertn
     out_data.rdtimel       := dec.rdtimel
     out_data.rdtimeh       := dec.rdtimeh
+    out_data.isCpucfg      := dec.isCpucfg
     
     out_data.src1_addr     := src1_addr
     out_data.src2_addr     := src2_addr

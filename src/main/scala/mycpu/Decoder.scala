@@ -34,6 +34,7 @@ class DecodeOut extends Bundle{
     
     val rdtimel         = Bool()
     val rdtimeh         = Bool()
+    val isCpucfg        = Bool()
 
     val src1_read       = Bool()
     val src2_read       = Bool()
@@ -179,6 +180,10 @@ class Decoder extends Module{
     val is_timer_h      = is_rdtime_base && inst(10) === 1.U
     val is_rdcntid      = is_rdtime_base && inst(10) === 0.U && rd === 0.U
 
+    // CPUCFG: op[31:15] = 0, op[14:10] = 11011, rj supplies the
+    // configuration-word index and rd receives the selected word.
+    val is_cpucfg       = inst(31, 15) === 0.U && inst(14, 10) === "b11011".U
+
     val is_tlbsrch = inst === BitPat("b000001_1001_00_10000_01010_00000_00000") // 06482800
     val is_tlbrd   = inst === BitPat("b000001_1001_00_10000_01011_00000_00000") // 06482C00
     val is_tlbwr   = inst === BitPat("b000001_1001_00_10000_01100_00000_00000") // 06483000
@@ -213,10 +218,11 @@ class Decoder extends Module{
 
     io.out.rdtimel      := is_timer_l && !is_rdcntid
     io.out.rdtimeh      := is_timer_h
+    io.out.isCpucfg     := is_cpucfg
 
-    io.out.regWe        := (reg_we === 1.U) || is_csr || is_rdtime_base
+    io.out.regWe        := (reg_we === 1.U) || is_csr || is_rdtime_base || is_cpucfg
     io.out.destReg :=   Mux(is_rdcntid, rj, 
-                        Mux(is_rdtime_base || is_csr, rd, 
+                        Mux(is_rdtime_base || is_csr || is_cpucfg, rd,
                         Mux1H(Seq(
                             (dst_s === Dst.RD.asUInt) -> rd,
                             (dst_s === Dst.RJ.asUInt) -> rj,
@@ -230,7 +236,7 @@ class Decoder extends Module{
     io.out.cacop_op := inst(4, 0)
 
     val inst_valid      =   (alu_s =/= AluOp.NOP) || (ls_s =/= LsOp.NOP) || (mdu_s =/= MduOp.NOP) || (br_t =/= BrType.NOP) || 
-                            is_syscall || is_break || is_ertn || is_csr || is_rdtime_base || is_tlb_inst || is_cacop
+                            is_syscall || is_break || is_ertn || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop
 
     io.out.hasException := !inst_valid || is_syscall || is_break
     io.out.ecode        :=  Mux(is_syscall, "h0B".U(6.W), 
@@ -242,6 +248,6 @@ class Decoder extends Module{
     val csr_reads_src1 = is_csr && !rj_is_zero && !rj_is_one
     val csr_reads_src2 = is_csr && !rj_is_zero
 
-    io.out.src1_read := inst_valid && (r1_re === 1.U || csr_reads_src1)
+    io.out.src1_read := inst_valid && (r1_re === 1.U || csr_reads_src1 || is_cpucfg)
     io.out.src2_read := inst_valid && (r2_re === 1.U || csr_reads_src2)
 }

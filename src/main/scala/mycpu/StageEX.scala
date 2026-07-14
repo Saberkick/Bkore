@@ -219,11 +219,15 @@ class StageEX extends Module {
     val csr_mask = Mux(data_reg.src1_addr === 0.U, 0.U(32.W),
                    Mux(data_reg.src1_addr === 1.U, "hFFFFFFFF".U(32.W),
                    src1_fwd))
-    val final_ex_result = Mux(is_tlbsrch, tlbsrch_res,
+    // Report no optional cache capability for now.  The NSCSCC startup code
+    // will consequently skip CACOP-based I/D/L2 cache initialization.
+    val cpucfg_result = 0.U(32.W)
+    val final_ex_result = Mux(data_reg.isCpucfg, cpucfg_result,
+                          Mux(is_tlbsrch, tlbsrch_res,
                           Mux(data_reg.rdtimel, io.timer_in(31, 0),
                           Mux(data_reg.rdtimeh, io.timer_in(63, 32),
                           Mux(data_reg.isCsr, src2_fwd, 
-                          Mux(data_reg.resFromMulDiv, mdu_res, alu_res)))))
+                          Mux(data_reg.resFromMulDiv, mdu_res, alu_res))))))
 
     // 强制 tlbsrch 只能修改 TLBIDX 的第 31 位(NE) 和低 4 位(Index)
     val aux_data = Mux(is_tlbsrch, tlbsrch_mask, 

@@ -77,6 +77,7 @@ class PipelineData extends Bundle{
     //These two were just used in EX
     val rdtimel         = Bool()
     val rdtimeh         = Bool()
+    val isCpucfg        = Bool()
 
     //TLB
     val tlbOp           = UInt(5.W)
