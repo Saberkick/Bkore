@@ -27,6 +27,10 @@ class StageIF extends Module {
         val tlb_s0_v        = Input(Bool())    // 用于判定取指页无效(PIF)
     })
 
+    // IF 职责：保存下一取指 PC，完成 DMW/TLB 地址翻译与取指异常判定，
+    // 再通过类 SRAM 握手访问 ICache。wait_data_reg 使前端最多只有一个未完成取指；
+    // buf_valid 在 ID 反压时暂存返回指令，discard_reg 丢弃 flush 前已发出的旧响应。
+    // 当前 next PC 只有 PC+4 或 Ctrl 给出的 EX/WB 重定向目标，没有预测路径。
     val pc_reg = RegInit(Config.START_PC)
     val va = pc_reg
     //MMU
@@ -80,6 +84,7 @@ class StageIF extends Module {
     val buf_valid     = RegInit(false.B)
     val inst_buffer   = Reg(UInt(32.W))
 
+    // 阻塞式取指：地址一旦握手，必须等 data_ok（或 flush 后把旧响应丢弃）才能再发请求。
     val allow_req = !wait_data_reg && !buf_valid
     // 1. 删掉 !if_mmu_exc，不管有没有异常，都必须发请求去拿 data_ok
     val req_valid = allow_req && !io.flush

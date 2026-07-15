@@ -14,6 +14,8 @@ class Regfile extends Module{
 		val wdata	= Input(UInt(32.W))
 	})
 
+	// 2R1W 寄存器堆；同拍 WB 写与 ID 读同一地址时直接旁路写数据（write-first）。
+	// x0/r0 恒为零且禁止写入，这是 WB -> ID 的最后一级零周期旁路。
 	val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
 	when (io.we && io.waddr =/= 0.U) {
 		regs(io.waddr) := io.wdata

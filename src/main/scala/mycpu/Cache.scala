@@ -49,6 +49,11 @@ class Cache extends Module {
         val cpu = new CacheToCpuIO()
         val axi = new CacheToAxiIO()
     })
+    // 一个参数固定、供 I/D 两端复用的阻塞式二路组相联 Cache：
+    //   256 sets * 2 ways * 16 B/line = 8192 B
+    // 地址格式为 tag[31:12] / index[11:4] / offset[3:0]，每行分成 4 个 32-bit bank。
+    // DCache 采用 write-back + write-allocate，dirty victim 先写回再 refill；ICache 只读，
+    // 因而正常路径不会产生 dirty write-back。一次只保存一个 miss 上下文。
     //Main FSM
 
     //If cache hit
@@ -81,6 +86,8 @@ class Cache extends Module {
     val wbIdle :: wbWrite :: Nil = Enum(2)
     val wb_state = RegInit(wbIdle)
 
+    // SyncReadMem 使 tag/data 查询至少跨一拍：Idle 接收地址，Lookup 比较两路 tag。
+    // 命中 store 先进入单项写缓冲，减少数据 RAM 写端口对下一次查询的阻塞。
     //Data Structure
     //TagV 20:1 Tag, 0 Valid
     val tagv_way0 = SyncReadMem(256, UInt(21.W))

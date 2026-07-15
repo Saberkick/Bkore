@@ -45,6 +45,9 @@ class StageEX extends Module {
 
 
 
+    // EX 是主要组合逻辑级：选择 MEM/WB 前递、执行 ALU/乘除法、解析分支，
+    // 同时生成访存虚拟地址并完成 DMW/TLB 翻译和地址/页异常检查。
+    // 访存请求在此只等待 addr_ok；数据返回与 load 扩展由 MEM 负责。
     val valid_reg = RegInit(false.B)
     val data_reg  = RegInit(0.U.asTypeOf(new PipelineData()))
 
@@ -89,7 +92,8 @@ class StageEX extends Module {
     when(io.in.valid && allow_in) { data_reg := io.in.bits }
     
 
-    //Forwarding Path
+    // 前递截止到 EX：优先使用较新的 MEM 结果，其次 WB，最后才是 ID 锁存的寄存器值。
+    // ID 已保证 load/CSR 在结果尚不可用时不会进入本级。
     val s1_mem_hit = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && (io.fwdFromMem.regWriteAddr === data_reg.src1_addr) && (data_reg.src1_addr =/= 0.U)
     val s1_wb_hit  = io.fwdFromWb.valid  && io.fwdFromWb.regWriteEn  && (io.fwdFromWb.regWriteAddr === data_reg.src1_addr) && (data_reg.src1_addr =/= 0.U)
     val s2_mem_hit = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && (io.fwdFromMem.regWriteAddr === data_reg.src2_addr) && (data_reg.src2_addr =/= 0.U)
@@ -103,7 +107,8 @@ class StageEX extends Module {
         data_reg.src2_value := src2_fwd
     }
 
-    //Branch 
+    // 分支在 EX 解析。当前无 predicted_taken/target 元数据：taken 就通知 Ctrl
+    // 重定向并 flush IF/ID，not-taken 则继续使用 IF 已选择的 PC+4。
     val eq  = (src1_fwd === src2_fwd)
     val lt  = (src1_fwd.asSInt < src2_fwd.asSInt)
     val ltu = (src1_fwd < src2_fwd)
@@ -266,6 +271,8 @@ class StageEX extends Module {
     //MODDED in AXI experiment
     val is_mem_inst = (data_reg.resFromMem || data_reg.memWe || data_reg.is_cacop) && valid_reg && !data_reg.hasException && !ale && !io.mem_has_exc_in
     val is_mem = is_mem_inst && !ex_mmu_exc
+    // 每条访存指令只允许一次 addr_ok 握手。若 MEM/Cache 反压导致 EX 暂留，
+    // mem_req_sent 会抑制重复请求，直到该指令真正离开 EX 或被 flush。
     val mem_req_sent = RegInit(false.B)
     val req_fire = io.data_sram.req && io.data_sram.addr_ok
 

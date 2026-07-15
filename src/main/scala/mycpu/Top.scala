@@ -75,6 +75,14 @@ class core_top extends RawModule {
 
     withClockAndReset(aclk, reset_high) {
 
+        // 总体结构（单发射、顺序提交）：
+        //   IF -> ID -> EX -> MEM -> WB
+        //    |              |           \
+        // ICache         DCache          RegFile/CSR/TLB 管理
+        //    \              /
+        //       SramToAxiBridge -> AXI
+        // 五个 Stage 之间都是单项 Decoupled 通道；每级最多保存一条指令。
+
         // 1. 例化所有内部模块
         val ctrl = Module(new Ctrl())
         val timer = Module(new StableCounter())
@@ -138,7 +146,9 @@ class core_top extends RawModule {
         tlb_module.io.r_index := wb_stage.io.tlb_r_idx
         wb_stage.io.tlb_r_dat := tlb_module.io.r_dat
 
-        // 2. 主数据通路与前递连线 (保持不变)
+        // 2. 主数据通路与前递连线。
+        // ID 读取寄存器并检测冒险；运算结果的真正旁路选择只在 EX 发生：
+        // MEM/WB -> EX。EX/MEM -> ID 的连线只用于判断 load/CSR 是否必须停顿。
         if_stage.io.out <> id_stage.io.in
         id_stage.io.out <> ex_stage.io.in
         ex_stage.io.out <> mem_stage.io.in
@@ -190,6 +200,8 @@ class core_top extends RawModule {
         val mem_is_icache_cacop = mem_is_cacop && (mem_cacop_op(2, 0) === 0.U)
 
         // -- 指令端 (IF & ICache) --
+        // ICache 与 DCache 都是同一个 Cache 模块的实例。地址拆分为
+        // tag[31:12] + index[11:4] + offset[3:0]，即 256 组、16B Cache line。
         // 控制 valid：如果 EX 有 CACOP，发 CACOP 请求；如果 MEM 有 CACOP，强行塞入 0 屏蔽请求；平时归 IF
         icache.io.cpu.valid  := Mux(ex_is_icache_cacop, ex_stage.io.data_sram.req,
                                 Mux(mem_is_icache_cacop, false.B,
@@ -214,6 +226,8 @@ class core_top extends RawModule {
         bridge.io.inst_cache <> icache.io.axi
 
         // -- 数据端 (EX/MEM & DCache) --
+        // EX 只等待地址被 Cache 接收(addr_ok)，随后请求随指令进入 MEM；
+        // MEM 保持该指令直到 Cache 返回 data_ok，因此数据访存对流水线是阻塞式的。
         // 如果正在搞 ICache 的 CACOP，DCache 闲置；否则正常接收 EX 的访存请求
         dcache.io.cpu.valid  := ex_stage.io.data_sram.req && !ex_is_icache_cacop
         dcache.io.cpu.op     := ex_stage.io.data_sram.wr

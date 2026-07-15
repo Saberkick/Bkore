@@ -20,6 +20,8 @@ class StageID extends Module {
 
         val flush = Input(Bool())
     })
+    // ID 流水寄存器。此级完成预译码、完整译码、双口寄存器读取和数据冒险判断，
+    // 但不在 ID 选择前递值；源操作数连同寄存器号送到 EX 后再旁路修正。
     val valid_reg = RegInit(false.B)
     val data_reg  = RegInit(0.U.asTypeOf(new PipelineData()))
 
@@ -39,6 +41,9 @@ class StageID extends Module {
     decoder.io.inst := data_reg.inst
     val dec = decoder.io.out
     
+    // ALU 结果可在下一条指令进入 EX 时由 MEM/WB 前递，不必停顿。
+    // Load 数据到 MEM 的 data_ok 才产生，CSR 读值到 WB 才产生，因此相关指令
+    // 在生产者位于 EX 或 MEM 时都停顿；这也避免把 MEM 的访存地址误当前递结果。
     val ex_is_load  = io.fwdFromEx.valid && io.fwdFromEx.resFromMem && io.fwdFromEx.regWriteEn
     val ex_is_csr   = io.fwdFromEx.valid && io.fwdFromEx.isCsr
     val mem_is_csr  = io.fwdFromMem.valid && io.fwdFromMem.isCsr
@@ -54,7 +59,8 @@ class StageID extends Module {
 
     val stall = ex_conflict_s1 || ex_conflict_s2 || mem_conflict_s1 || mem_conflict_s2 || csr_hazard
     
-    //Pipeline Settings
+    // 标准弹性流水级：空级可收数据；本级完成且下级 ready 时可同拍“出旧进新”。
+    // stall 拉低 ready_go 后，反压会沿 EX <- ID <- IF 一直传播。
     val ready_go = !stall
     val allow_in = !valid_reg || (ready_go && io.out.ready)
     io.in.ready := allow_in

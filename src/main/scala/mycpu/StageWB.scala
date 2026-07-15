@@ -35,6 +35,9 @@ class StageWB extends Module {
         val debug_wb_rf_wdata = Output(UInt(32.W))
     })
 
+    // WB 是顺序提交点：写通用寄存器，读写 CSR，提交 TLBWR/TLBFILL/TLBRD，
+    // 并在异常、ERTN 或地址翻译状态改变时产生全流水线 flush/refetch。
+    // 本级恒 ready；只有 valid 且无异常的指令能够产生体系结构写操作。
     val valid_reg = RegInit(false.B)
     val data_reg  = RegInit(0.U.asTypeOf(new PipelineData()))
 

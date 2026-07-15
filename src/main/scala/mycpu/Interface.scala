@@ -25,6 +25,8 @@ class SramIo extends Bundle {
     val rdata   = Input(UInt(32.W))
 }
 
+// 前递网络只把“生产者是否可用、目的寄存器和结果”送到前级。
+// 真正的数据选择发生在 EX；ID 仅使用这些元数据判断 load/CSR 等不可前递冒险。
 class ForwardingData extends Bundle {
     val valid        = Bool()
     val regWriteEn   = Bool()
@@ -35,6 +37,9 @@ class ForwardingData extends Bundle {
 }
 
 
+// 五级流水线唯一的级间载荷。Top.scala 用 Decoupled 将 IF/ID/EX/MEM/WB 串联：
+// valid 表示本级持有一条有效指令，ready 由后级反压；每级内部的 valid_reg/data_reg
+// 就是流水寄存器。因此任一级（除法、访存、Cache miss 等）停顿都会自然冻结所有前级。
 class PipelineData extends Bundle{
     //IF Generated
     val pc              = UInt(32.W)

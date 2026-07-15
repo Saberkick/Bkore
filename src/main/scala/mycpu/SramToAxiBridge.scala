@@ -13,6 +13,13 @@ class SramToAxiBridge extends Module {
         val axi = new AxiIO()
     })
 
+    // 桥的并发边界要区分清楚：
+    // 1) AR 状态机在 ICache/DCache 之间仲裁，全局最多一个未完成读 burst；DCache 优先。
+    // 2) AW/W 有独立的单项写缓冲，所以“一个读 + 一个缓存行写回”理论上可以并行，
+    //    并非所有 AXI 五通道共享一个全局 busy。
+    // 3) 非缓存写使用 write_pending 强序化，必须等 B 响应后才接受新的读写。
+    // 流水线侧仍是阻塞式：DCache/MEM 一次只维护一条数据访存指令。
+
     // 提取有效的读写请求
     val inst_req_read  = io.inst_cache.rd_req
     val data_req_read  = io.data_cache.rd_req

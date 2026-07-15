@@ -68,6 +68,10 @@ class tlb extends Module {
         val r_index = Input(UInt(4.W))
         val r_dat   = Output(new TlbEntry())
     })
+    // 16 项全相联 TLB，使用寄存器阵列和 16 路并行比较实现两个组合查询端口：
+    // s0 服务 IF，s1 服务 EX 的 load/store、TLBSRCH/INVTLB。每项含一对奇偶页描述符，
+    // 支持 4KB 与 2MB 页、ASID/global、PLV、MAT、D/V；读写管理在 WB/CSR 侧提交。
+    // 这条“双端口全相联比较 -> PriorityEncoder -> 页属性选择”路径也是潜在时序热点。
     val tlb_table = Reg(Vec(16, new TlbEntry()))
     //Write a PTE
     when(io.we) { tlb_table(io.w_index) := io.w_dat }

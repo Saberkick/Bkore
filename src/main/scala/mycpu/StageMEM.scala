@@ -24,6 +24,9 @@ class StageMEM extends Module {
         val current_valid = Output(Bool())
     })
 
+    // MEM 是阻塞式访存完成级：普通 ALU 指令可立即通过；load/store/CACOP 必须等
+    // data_ok 才能前进。load 在这里按地址低位选字节/半字并做符号或零扩展。
+    // flush 时若 Cache 中已有请求，discard_reg 会吞掉迟到响应，防止匹配到新指令。
     val valid_reg = RegInit(false.B)
     val data_reg  = RegInit(0.U.asTypeOf(new PipelineData()))
 
