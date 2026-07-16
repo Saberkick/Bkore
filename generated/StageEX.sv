@@ -6,6 +6,8 @@ module StageEX(
   input         io_in_valid,
   input  [31:0] io_in_bits_pc,
                 io_in_bits_inst,
+  input         io_in_bits_predictedTaken,
+  input  [31:0] io_in_bits_predictedTarget,
   input  [11:0] io_in_bits_aluOp,
   input  [6:0]  io_in_bits_mduOp,
   input  [8:0]  io_in_bits_brType,
@@ -14,7 +16,6 @@ module StageEX(
                 io_in_bits_src2IsImm,
                 io_in_bits_src2IsFour,
   input  [4:0]  io_in_bits_src1_addr,
-                io_in_bits_src2_addr,
   input  [31:0] io_in_bits_src1_value,
                 io_in_bits_src2_value,
   input         io_in_bits_resFromMulDiv,
@@ -58,21 +59,19 @@ module StageEX(
   output        io_out_bits_is_refetch,
                 io_out_bits_is_cacop,
   output [4:0]  io_out_bits_cacop_op,
-  input         io_fwdFromMem_valid,
-                io_fwdFromMem_regWriteEn,
-  input  [4:0]  io_fwdFromMem_regWriteAddr,
-  input  [31:0] io_fwdFromMem_result,
-  input         io_fwdFromWb_valid,
-                io_fwdFromWb_regWriteEn,
-  input  [4:0]  io_fwdFromWb_regWriteAddr,
-  input  [31:0] io_fwdFromWb_result,
   output        io_fwdOut_valid,
                 io_fwdOut_regWriteEn,
   output [4:0]  io_fwdOut_regWriteAddr,
+  output [31:0] io_fwdOut_result,
   output        io_fwdOut_resFromMem,
                 io_fwdOut_isCsr,
                 io_branch_req,
   output [31:0] io_branch_pc,
+  output        io_bp_update_valid,
+  output [31:0] io_bp_update_pc,
+  output        io_bp_update_isBranch,
+                io_bp_update_taken,
+  output [31:0] io_bp_update_target,
   input         io_flush,
   input  [63:0] io_timer_in,
   output        io_data_sram_req,
@@ -115,6 +114,9 @@ module StageEX(
 );
 
   wire        ready_go;
+  wire        div_start;
+  wire        mul_start;
+  wire        _div_io_ready;
   wire [31:0] _div_io_q;
   wire [31:0] _div_io_r;
   wire        _div_io_done;
@@ -123,6 +125,8 @@ module StageEX(
   reg         valid_reg;
   reg  [31:0] data_reg_pc;
   reg  [31:0] data_reg_inst;
+  reg         data_reg_predictedTaken;
+  reg  [31:0] data_reg_predictedTarget;
   reg  [11:0] data_reg_aluOp;
   reg  [6:0]  data_reg_mduOp;
   reg  [8:0]  data_reg_brType;
@@ -131,7 +135,6 @@ module StageEX(
   reg         data_reg_src2IsImm;
   reg         data_reg_src2IsFour;
   reg  [4:0]  data_reg_src1_addr;
-  reg  [4:0]  data_reg_src2_addr;
   reg  [31:0] data_reg_src1_value;
   reg  [31:0] data_reg_src2_value;
   reg         data_reg_resFromMulDiv;
@@ -161,61 +164,86 @@ module StageEX(
   wire        _mdu_res_T_3 = data_reg_mduOp == 7'h1;
   wire        _mdu_res_T_5 = data_reg_mduOp == 7'h2;
   wire        _mdu_res_T_7 = data_reg_mduOp == 7'h4;
-  wire        is_mdu = data_reg_resFromMulDiv & ~data_reg_hasException;
   reg         mdu_busy;
   reg         mdu_finished;
+  wire        mdu_start = mul_start | div_start;
   reg         mul_done;
   wire        _mdu_ready_T_2 = _div_io_done | mul_done;
   wire        allow_in = ~valid_reg | ready_go & io_out_ready;
-  wire        _s2_mem_hit_T = io_fwdFromMem_valid & io_fwdFromMem_regWriteEn;
-  wire        s1_mem_hit =
-    _s2_mem_hit_T & io_fwdFromMem_regWriteAddr == data_reg_src1_addr
-    & (|data_reg_src1_addr);
-  wire        _s2_wb_hit_T = io_fwdFromWb_valid & io_fwdFromWb_regWriteEn;
-  wire        s1_wb_hit =
-    _s2_wb_hit_T & io_fwdFromWb_regWriteAddr == data_reg_src1_addr
-    & (|data_reg_src1_addr);
-  wire        s2_mem_hit =
-    _s2_mem_hit_T & io_fwdFromMem_regWriteAddr == data_reg_src2_addr
-    & (|data_reg_src2_addr);
-  wire        s2_wb_hit =
-    _s2_wb_hit_T & io_fwdFromWb_regWriteAddr == data_reg_src2_addr
-    & (|data_reg_src2_addr);
-  wire [31:0] src1_fwd =
-    s1_mem_hit
-      ? io_fwdFromMem_result
-      : s1_wb_hit ? io_fwdFromWb_result : data_reg_src1_value;
-  wire [31:0] src2_fwd =
-    s2_mem_hit
-      ? io_fwdFromMem_result
-      : s2_wb_hit ? io_fwdFromWb_result : data_reg_src2_value;
   wire        _br_base_T = data_reg_brType == 9'h40;
+  wire [31:0] _branch_target_T =
+    (_br_base_T ? data_reg_src1_value : data_reg_pc) + data_reg_imm;
+  wire        actual_taken =
+    (|data_reg_brType)
+    & (data_reg_brType == 9'h100 | data_reg_brType == 9'h80 | _br_base_T
+       | (data_reg_brType == 9'h20
+            ? data_reg_src1_value >= data_reg_src2_value
+            : data_reg_brType == 9'h10
+                ? data_reg_src1_value < data_reg_src2_value
+                : data_reg_brType == 9'h8
+                    ? $signed(data_reg_src1_value) >= $signed(data_reg_src2_value)
+                    : data_reg_brType == 9'h4
+                        ? $signed(data_reg_src1_value) < $signed(data_reg_src2_value)
+                        : data_reg_brType == 9'h2
+                            ? data_reg_src1_value != data_reg_src2_value
+                            : data_reg_brType == 9'h1
+                              & data_reg_src1_value == data_reg_src2_value));
+  wire        _io_out_valid_T = valid_reg & ready_go;
+  wire        io_bp_update_valid_0 =
+    _io_out_valid_T & io_out_ready & ~io_flush & ~data_reg_hasException
+    & ~io_mem_has_exc_in & ((|data_reg_brType) | data_reg_predictedTaken);
+  wire        _is_mem_inst_T = data_reg_resFromMem | data_reg_memWe;
+  wire [31:0] _mem_va_T = data_reg_src1_value + data_reg_imm;
   wire        is_tlbsrch = data_reg_tlbOp == 5'h1;
   wire        is_invtlb = data_reg_tlbOp == 5'h10;
   wire        _dmw1_hit_T_6 = io_mmu_config_crmd_plv == 2'h0;
   wire        dmw0_hit =
     io_mmu_config_crmd_pg & ~io_mmu_config_crmd_da
-    & _alu_io_res[31:29] == io_mmu_config_dmw0_vseg
+    & _mem_va_T[31:29] == io_mmu_config_dmw0_vseg
     & (_dmw1_hit_T_6 & io_mmu_config_dmw0_plv0 | (&io_mmu_config_crmd_plv)
        & io_mmu_config_dmw0_plv3);
   wire        dmw_hit =
     dmw0_hit | io_mmu_config_crmd_pg & ~io_mmu_config_crmd_da
-    & _alu_io_res[31:29] == io_mmu_config_dmw1_vseg
+    & _mem_va_T[31:29] == io_mmu_config_dmw1_vseg
     & (_dmw1_hit_T_6 & io_mmu_config_dmw1_plv0 | (&io_mmu_config_crmd_plv)
        & io_mmu_config_dmw1_plv3);
   reg  [31:0] mdu_src1_reg;
   reg  [31:0] mdu_src2_reg;
   wire        _real_mdu_src2_T = mdu_busy | mdu_finished;
-  wire [31:0] mul_io_src1 = _real_mdu_src2_T ? mdu_src1_reg : src1_fwd;
-  wire [31:0] mul_io_src2 = _real_mdu_src2_T ? mdu_src2_reg : src2_fwd;
+  wire [31:0] mul_io_src1 = _real_mdu_src2_T ? mdu_src1_reg : data_reg_src1_value;
+  wire [31:0] mul_io_src2 = _real_mdu_src2_T ? mdu_src2_reg : data_reg_src2_value;
   wire        mul_io_isSigned = _mdu_res_T_5 | _mdu_res_T_9 | _mdu_res_T_11;
+  assign mul_start =
+    valid_reg & (_mdu_res_T_3 | _mdu_res_T_5 | _mdu_res_T_7) & ~data_reg_hasException
+    & ~mdu_busy & ~mdu_finished & ~io_flush;
+  wire        div_request =
+    valid_reg & (_mdu_res_T_9 | _mdu_res_T_11 | _mdu_res_T_13 | _mdu_res_T_15)
+    & ~data_reg_hasException & ~mdu_busy & ~mdu_finished & ~io_flush;
+  assign div_start = div_request & _div_io_ready;
+  wire        divide_by_zero = mul_io_src2 == 32'h0;
+  wire [31:0] mdu_res =
+    _mdu_res_T_15
+      ? _div_io_r
+      : _mdu_res_T_13
+          ? _div_io_q
+          : _mdu_res_T_11
+              ? (divide_by_zero
+                   ? mul_io_src1
+                   : mul_io_isSigned & mul_io_src1[31] ? ~_div_io_r + 32'h1 : _div_io_r)
+              : _mdu_res_T_9
+                  ? (divide_by_zero
+                       ? 32'hFFFFFFFF
+                       : mul_io_isSigned & (mul_io_src1[31] ^ mul_io_src2[31])
+                           ? ~_div_io_q + 32'h1
+                           : _div_io_q)
+                  : _mdu_res_T_7 | _mdu_res_T_5
+                      ? _mul_io_result64[63:32]
+                      : _mdu_res_T_3 ? _mul_io_result64[31:0] : 32'h0;
   wire        isWord = data_reg_lsOp == 8'h4 | data_reg_lsOp == 8'h80;
   wire        isHalf =
     data_reg_lsOp == 8'h2 | data_reg_lsOp == 8'h10 | data_reg_lsOp == 8'h40;
-  wire        _is_mem_inst_T = data_reg_resFromMem | data_reg_memWe;
   wire        ale =
-    _is_mem_inst_T & valid_reg
-    & (isWord & (|(_alu_io_res[1:0])) | isHalf & _alu_io_res[0]);
+    _is_mem_inst_T & valid_reg & (isWord & (|(_mem_va_T[1:0])) | isHalf & _mem_va_T[0]);
   wire        is_mapped = io_mmu_config_crmd_pg & ~io_mmu_config_crmd_da & ~dmw_hit;
   wire        is_load = data_reg_resFromMem & valid_reg & ~data_reg_hasException & ~ale;
   wire        is_store = data_reg_memWe & valid_reg & ~data_reg_hasException & ~ale;
@@ -233,23 +261,24 @@ module StageEX(
   wire        exc_pis = _exc_pme_T & io_tlb_s1_found & ~io_tlb_s1_v;
   wire        exc_pme =
     _exc_pme_T & io_tlb_s1_found & io_tlb_s1_v & ~exc_ppi_ex & ~io_tlb_s1_d;
-  wire        ex_mmu_exc = exc_tlb_refill_ex | exc_ppi_ex | exc_pil | exc_pis | exc_pme;
+  wire        mmu_fault = exc_tlb_refill_ex | exc_ppi_ex | exc_pil | exc_pis | exc_pme;
   wire        is_mem_inst =
     (_is_mem_inst_T | data_reg_is_cacop) & valid_reg & ~data_reg_hasException & ~ale
     & ~io_mem_has_exc_in;
-  wire        is_mem = is_mem_inst & ~ex_mmu_exc;
+  wire        is_mem = is_mem_inst & ~mmu_fault;
   reg         mem_req_sent;
-  wire        _io_out_valid_T = valid_reg & ready_go;
-  wire [6:0]  stMaskB = 7'h1 << _alu_io_res[1:0];
+  wire [6:0]  stMaskB = 7'h1 << _mem_va_T[1:0];
   wire        io_data_sram_req_0 = is_mem & ~mem_req_sent & io_out_ready & ~io_flush;
   assign ready_go =
-    (~is_mdu | mdu_finished | mdu_busy & _mdu_ready_T_2)
-    & (~is_mem_inst | io_data_sram_addr_ok | mem_req_sent);
+    (~(data_reg_resFromMulDiv & ~data_reg_hasException) | mdu_finished | mdu_busy
+     & _mdu_ready_T_2) & (~is_mem_inst | io_data_sram_addr_ok | mem_req_sent);
   always @(posedge clock or posedge reset) begin
     if (reset) begin
       valid_reg <= 1'h0;
       data_reg_pc <= 32'h0;
       data_reg_inst <= 32'h0;
+      data_reg_predictedTaken <= 1'h0;
+      data_reg_predictedTarget <= 32'h0;
       data_reg_aluOp <= 12'h0;
       data_reg_mduOp <= 7'h0;
       data_reg_brType <= 9'h0;
@@ -258,7 +287,6 @@ module StageEX(
       data_reg_src2IsImm <= 1'h0;
       data_reg_src2IsFour <= 1'h0;
       data_reg_src1_addr <= 5'h0;
-      data_reg_src2_addr <= 5'h0;
       data_reg_src1_value <= 32'h0;
       data_reg_src2_value <= 32'h0;
       data_reg_resFromMulDiv <= 1'h0;
@@ -288,15 +316,13 @@ module StageEX(
     end
     else begin
       automatic logic _GEN;
-      automatic logic _GEN_0;
-      automatic logic _GEN_1;
-      _GEN = valid_reg & is_mdu & ~mdu_busy & ~mdu_finished;
-      _GEN_0 = mdu_busy & _mdu_ready_T_2;
-      _GEN_1 = io_in_valid & allow_in;
+      _GEN = mdu_busy & _mdu_ready_T_2;
       valid_reg <= ~io_flush & (allow_in ? io_in_valid : valid_reg);
-      if (_GEN_1) begin
+      if (io_in_valid & allow_in) begin
         data_reg_pc <= io_in_bits_pc;
         data_reg_inst <= io_in_bits_inst;
+        data_reg_predictedTaken <= io_in_bits_predictedTaken;
+        data_reg_predictedTarget <= io_in_bits_predictedTarget;
         data_reg_aluOp <= io_in_bits_aluOp;
         data_reg_mduOp <= io_in_bits_mduOp;
         data_reg_brType <= io_in_bits_brType;
@@ -305,7 +331,8 @@ module StageEX(
         data_reg_src2IsImm <= io_in_bits_src2IsImm;
         data_reg_src2IsFour <= io_in_bits_src2IsFour;
         data_reg_src1_addr <= io_in_bits_src1_addr;
-        data_reg_src2_addr <= io_in_bits_src2_addr;
+        data_reg_src1_value <= io_in_bits_src1_value;
+        data_reg_src2_value <= io_in_bits_src2_value;
         data_reg_resFromMulDiv <= io_in_bits_resFromMulDiv;
         data_reg_memWe <= io_in_bits_memWe;
         data_reg_lsOp <= io_in_bits_lsOp;
@@ -327,40 +354,24 @@ module StageEX(
         data_reg_is_cacop <= io_in_bits_is_cacop;
         data_reg_cacop_op <= io_in_bits_cacop_op;
       end
-      if (valid_reg & ~allow_in) begin
-        if (s1_mem_hit)
-          data_reg_src1_value <= io_fwdFromMem_result;
-        else if (s1_wb_hit)
-          data_reg_src1_value <= io_fwdFromWb_result;
-        if (s2_mem_hit)
-          data_reg_src2_value <= io_fwdFromMem_result;
-        else if (s2_wb_hit)
-          data_reg_src2_value <= io_fwdFromWb_result;
-      end
-      else if (_GEN_1) begin
-        data_reg_src1_value <= io_in_bits_src1_value;
-        data_reg_src2_value <= io_in_bits_src2_value;
-      end
-      mdu_busy <= ~io_flush & (_GEN | ~_GEN_0 & mdu_busy);
+      mdu_busy <= ~io_flush & (mdu_start | ~_GEN & mdu_busy);
       mdu_finished <=
         ~io_flush
-        & (_GEN
+        & (mdu_start
              ? mdu_finished
-             : _GEN_0
+             : _GEN
                  ? ~io_out_ready
                  : ~(valid_reg & ready_go & io_out_ready) & mdu_finished);
-      mul_done <=
-        valid_reg & (_mdu_res_T_3 | _mdu_res_T_5 | _mdu_res_T_7) & ~data_reg_hasException
-        & ~mdu_busy & ~io_flush;
+      mul_done <= mul_start;
       mem_req_sent <=
         ~(io_flush | _io_out_valid_T & io_out_ready)
         & (io_data_sram_req_0 & io_data_sram_addr_ok | mem_req_sent);
     end
   end // always @(posedge, posedge)
   always @(posedge clock) begin
-    if (valid_reg & ~mdu_busy & ~mdu_finished) begin
-      mdu_src1_reg <= src1_fwd;
-      mdu_src2_reg <= src2_fwd;
+    if (mdu_start) begin
+      mdu_src1_reg <= data_reg_src1_value;
+      mdu_src2_reg <= data_reg_src2_value;
     end
   end // always @(posedge)
   `ifdef ENABLE_INITIAL_REG_
@@ -372,6 +383,8 @@ module StageEX(
         valid_reg = 1'h0;
         data_reg_pc = 32'h0;
         data_reg_inst = 32'h0;
+        data_reg_predictedTaken = 1'h0;
+        data_reg_predictedTarget = 32'h0;
         data_reg_aluOp = 12'h0;
         data_reg_mduOp = 7'h0;
         data_reg_brType = 9'h0;
@@ -380,7 +393,6 @@ module StageEX(
         data_reg_src2IsImm = 1'h0;
         data_reg_src2IsFour = 1'h0;
         data_reg_src1_addr = 5'h0;
-        data_reg_src2_addr = 5'h0;
         data_reg_src1_value = 32'h0;
         data_reg_src2_value = 32'h0;
         data_reg_resFromMulDiv = 1'h0;
@@ -415,9 +427,11 @@ module StageEX(
   `endif // ENABLE_INITIAL_REG_
   ALU alu (
     .io_aluOp (data_reg_aluOp),
-    .io_src1  (data_reg_src1IsPC ? data_reg_pc : src1_fwd),
+    .io_src1  (data_reg_src1IsPC ? data_reg_pc : data_reg_src1_value),
     .io_src2
-      (data_reg_src2IsImm ? data_reg_imm : data_reg_src2IsFour ? 32'h4 : src2_fwd),
+      (data_reg_src2IsImm
+         ? data_reg_imm
+         : data_reg_src2IsFour ? 32'h4 : data_reg_src2_value),
     .io_res   (_alu_io_res)
   );
   Multiplier mul (
@@ -429,11 +443,12 @@ module StageEX(
   );
   Divider div (
     .clock     (clock),
-    .io_enable
-      (valid_reg & (_mdu_res_T_9 | _mdu_res_T_11 | _mdu_res_T_13 | _mdu_res_T_15)
-       & ~data_reg_hasException & ~mdu_busy & ~mdu_finished & ~io_flush),
-    .io_a      (mul_io_isSigned & src1_fwd[31] ? ~src1_fwd + 32'h1 : mul_io_src1),
-    .io_b      (mul_io_isSigned & src2_fwd[31] ? ~src2_fwd + 32'h1 : mul_io_src2),
+    .reset     (reset),
+    .io_enable (div_request),
+    .io_flush  (io_flush),
+    .io_a      (mul_io_isSigned & mul_io_src1[31] ? ~mul_io_src1 + 32'h1 : mul_io_src1),
+    .io_b      (mul_io_isSigned & mul_io_src2[31] ? ~mul_io_src2 + 32'h1 : mul_io_src2),
+    .io_ready  (_div_io_ready),
     .io_q      (_div_io_q),
     .io_r      (_div_io_r),
     .io_done   (_div_io_done)
@@ -457,46 +472,24 @@ module StageEX(
               : data_reg_rdtimeh
                   ? io_timer_in[63:32]
                   : data_reg_isCsr
-                      ? src2_fwd
+                      ? data_reg_src2_value
                       : data_reg_resFromMulDiv
-                          ? (_mdu_res_T_15
-                               ? _div_io_r
-                               : _mdu_res_T_13
-                                   ? _div_io_q
-                                   : _mdu_res_T_11
-                                       ? (mul_io_isSigned & mul_io_src1[31]
-                                            ? ~_div_io_r + 32'h1
-                                            : _div_io_r)
-                                       : _mdu_res_T_9
-                                           ? (mul_io_isSigned
-                                              & (mul_io_src1[31] ^ mul_io_src2[31])
-                                                ? ~_div_io_q + 32'h1
-                                                : _div_io_q)
-                                           : _mdu_res_T_7 | _mdu_res_T_5
-                                               ? _mul_io_result64[63:32]
-                                               : _mdu_res_T_3
-                                                   ? _mul_io_result64[31:0]
-                                                   : 32'h0)
-                          : _alu_io_res;
+                          ? mdu_res
+                          : _is_mem_inst_T | data_reg_is_cacop ? _mem_va_T : _alu_io_res;
   assign io_out_bits_aux_data =
     is_tlbsrch
       ? (io_tlb_s1_found ? 32'h8000000F : 32'h80000000)
       : data_reg_isCsr
           ? (data_reg_src1_addr == 5'h0
                ? 32'h0
-               : data_reg_src1_addr == 5'h1 ? 32'hFFFFFFFF : src1_fwd)
-          : src2_fwd;
-  assign io_out_bits_hasException = data_reg_hasException | ale | ex_mmu_exc;
+               : data_reg_src1_addr == 5'h1 ? 32'hFFFFFFFF : data_reg_src1_value)
+          : data_reg_src2_value;
+  assign io_out_bits_hasException = data_reg_hasException | ale | mmu_fault;
   assign io_out_bits_ecode =
     data_reg_hasException
       ? data_reg_ecode
-      : ale
-          ? 6'h9
-          : exc_tlb_refill_ex
-              ? 6'h3F
-              : exc_pil
-                  ? 6'h1
-                  : exc_pis ? 6'h2 : exc_ppi_ex ? 6'h7 : {3'h0, exc_pme, 2'h0};
+      : {2'h0, {4{ale}} & 4'h9} | {6{exc_tlb_refill_ex}} | {5'h0, exc_pil}
+        | {4'h0, exc_pis, 1'h0} | {3'h0, {3{exc_ppi_ex}}} | {3'h0, exc_pme, 2'h0};
   assign io_out_bits_isCsr = data_reg_isCsr;
   assign io_out_bits_csrWe = data_reg_csrWe;
   assign io_out_bits_csrNum = data_reg_csrNum;
@@ -508,48 +501,52 @@ module StageEX(
   assign io_fwdOut_valid = valid_reg;
   assign io_fwdOut_regWriteEn = data_reg_regWriteEn;
   assign io_fwdOut_regWriteAddr = data_reg_destReg;
+  assign io_fwdOut_result =
+    data_reg_isCpucfg
+      ? 32'h0
+      : data_reg_rdtimel
+          ? io_timer_in[31:0]
+          : data_reg_rdtimeh
+              ? io_timer_in[63:32]
+              : data_reg_resFromMulDiv ? mdu_res : _alu_io_res;
   assign io_fwdOut_resFromMem = data_reg_resFromMem;
   assign io_fwdOut_isCsr = data_reg_isCsr;
   assign io_branch_req =
-    valid_reg
-    & (data_reg_brType == 9'h100 | data_reg_brType == 9'h80 | _br_base_T
-       | (data_reg_brType == 9'h20
-            ? src1_fwd >= src2_fwd
-            : data_reg_brType == 9'h10
-                ? src1_fwd < src2_fwd
-                : data_reg_brType == 9'h8
-                    ? $signed(src1_fwd) >= $signed(src2_fwd)
-                    : data_reg_brType == 9'h4
-                        ? $signed(src1_fwd) < $signed(src2_fwd)
-                        : data_reg_brType == 9'h2
-                            ? src1_fwd != src2_fwd
-                            : data_reg_brType == 9'h1 & src1_fwd == src2_fwd))
-    & ~data_reg_hasException & io_out_ready;
-  assign io_branch_pc = (_br_base_T ? src1_fwd : data_reg_pc) + data_reg_imm;
+    io_bp_update_valid_0
+    & (data_reg_predictedTaken != actual_taken | actual_taken
+       & data_reg_predictedTarget != _branch_target_T);
+  assign io_branch_pc = actual_taken ? _branch_target_T : data_reg_pc + 32'h4;
+  assign io_bp_update_valid = io_bp_update_valid_0;
+  assign io_bp_update_pc = data_reg_pc;
+  assign io_bp_update_isBranch = |data_reg_brType;
+  assign io_bp_update_taken = actual_taken;
+  assign io_bp_update_target = _branch_target_T;
   assign io_data_sram_req = io_data_sram_req_0;
   assign io_data_sram_wr = valid_reg & data_reg_memWe;
   assign io_data_sram_wstrb =
     data_reg_memWe & is_mem & ~io_flush
-      ? (isWord ? 4'hF : isHalf ? (_alu_io_res[1] ? 4'hC : 4'h3) : stMaskB[3:0])
+      ? (isWord ? 4'hF : isHalf ? (_mem_va_T[1] ? 4'hC : 4'h3) : stMaskB[3:0])
       : 4'h0;
   assign io_data_sram_addr =
     valid_reg
       ? {data_reg_is_cacop & data_reg_cacop_op[4:3] != 2'h2
-           ? _alu_io_res[31:12]
+           ? _mem_va_T[31:12]
            : io_mmu_config_crmd_da & ~io_mmu_config_crmd_pg
-               ? _alu_io_res[31:12]
+               ? _mem_va_T[31:12]
                : dmw_hit
                    ? {dmw0_hit ? io_mmu_config_dmw0_pseg : io_mmu_config_dmw1_pseg,
-                      _alu_io_res[28:12]}
+                      _mem_va_T[28:12]}
                    : io_tlb_s1_found & io_tlb_s1_v
                        ? (io_tlb_s1_ps == 6'hC
                             ? io_tlb_s1_ppn
-                            : {io_tlb_s1_ppn[19:9], _alu_io_res[20:12]})
-                       : _alu_io_res[31:12],
-         _alu_io_res[11:0]}
+                            : {io_tlb_s1_ppn[19:9], _mem_va_T[20:12]})
+                       : _mem_va_T[31:12],
+         _mem_va_T[11:0]}
       : 32'h0;
   assign io_data_sram_wdata =
-    isWord ? src2_fwd : isHalf ? {2{src2_fwd[15:0]}} : {4{src2_fwd[7:0]}};
+    isWord
+      ? data_reg_src2_value
+      : isHalf ? {2{data_reg_src2_value[15:0]}} : {4{data_reg_src2_value[7:0]}};
   assign io_data_uncached =
     (io_mmu_config_crmd_da & ~io_mmu_config_crmd_pg
        ? io_mmu_config_crmd_datm
@@ -558,10 +555,10 @@ module StageEX(
            : io_tlb_s1_mat) == 2'h0;
   assign io_tlb_s1_vppn =
     is_invtlb
-      ? src2_fwd[31:13]
-      : is_tlbsrch ? io_mmu_config_tlbehi_vppn : _alu_io_res[31:13];
-  assign io_tlb_s1_va_bit12 = _alu_io_res[12];
-  assign io_tlb_s1_asid = is_invtlb ? src1_fwd[9:0] : io_mmu_config_asid_asid;
+      ? data_reg_src2_value[31:13]
+      : is_tlbsrch ? io_mmu_config_tlbehi_vppn : _mem_va_T[31:13];
+  assign io_tlb_s1_va_bit12 = _mem_va_T[12];
+  assign io_tlb_s1_asid = is_invtlb ? data_reg_src1_value[9:0] : io_mmu_config_asid_asid;
   assign io_invtlb_valid = is_invtlb & valid_reg & ~data_reg_hasException;
   assign io_invtlb_op = data_reg_invtlb_op;
 endmodule

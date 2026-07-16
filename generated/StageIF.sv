@@ -6,10 +6,17 @@ module StageIF(
   output        io_out_valid,
   output [31:0] io_out_bits_pc,
                 io_out_bits_inst,
+  output        io_out_bits_predictedTaken,
+  output [31:0] io_out_bits_predictedTarget,
   output        io_out_bits_hasException,
   output [5:0]  io_out_bits_ecode,
   input         io_flush,
   input  [31:0] io_flush_target_pc,
+  input         io_bp_update_valid,
+  input  [31:0] io_bp_update_pc,
+  input         io_bp_update_isBranch,
+                io_bp_update_taken,
+  input  [31:0] io_bp_update_target,
   output        io_inst_sram_req,
   output [31:0] io_inst_sram_addr,
   input         io_inst_sram_addr_ok,
@@ -42,7 +49,8 @@ module StageIF(
   input         io_tlb_s0_v
 );
 
-  wire [1:0]  _pc_alignment_error_T;
+  wire        _predictor_io_predictedTaken;
+  wire [31:0] _predictor_io_predictedTarget;
   reg  [31:0] pc_reg;
   wire        _dmw1_hit_T_6 = io_mmu_config_crmd_plv == 2'h0;
   wire        dmw0_hit =
@@ -61,43 +69,83 @@ module StageIF(
   wire        exc_pif = _exc_ppi_if_T & ~io_tlb_s0_v;
   wire        exc_ppi_if =
     _exc_ppi_if_T & io_tlb_s0_v & (&io_mmu_config_crmd_plv) & io_tlb_s0_plv == 2'h0;
+  wire        req_has_exception =
+    (|(pc_reg[1:0])) | exc_tlb_refill_if | exc_pif | exc_ppi_if;
   reg         wait_data_reg;
+  reg  [31:0] pending_pc;
+  reg         pending_has_exc;
+  reg  [5:0]  pending_ecode;
+  reg         pending_pred_taken;
+  reg  [31:0] pending_pred_target;
   reg         discard_reg;
   reg         buf_valid;
   reg  [31:0] inst_buffer;
-  wire        req_valid = ~wait_data_reg & ~buf_valid & ~io_flush;
-  wire        out_data_hasException =
-    (|_pc_alignment_error_T) | exc_tlb_refill_if | exc_pif | exc_ppi_if;
-  wire        addr_handshaked = req_valid & io_inst_sram_addr_ok;
-  wire        real_data_ok = io_inst_sram_data_ok & ~discard_reg;
-  wire        _GEN = real_data_ok & ~io_out_ready;
-  assign _pc_alignment_error_T = pc_reg[1:0];
+  reg  [31:0] buffer_pc;
+  reg         buffer_has_exc;
+  reg  [5:0]  buffer_ecode;
+  reg         buffer_pred_taken;
+  reg  [31:0] buffer_pred_target;
+  wire        data_handshaked = wait_data_reg & io_inst_sram_data_ok & ~discard_reg;
+  wire        buffer_consumed = buf_valid & io_out_ready;
+  wire        req_valid =
+    (~wait_data_reg | data_handshaked & io_out_ready) & (~buf_valid | buffer_consumed)
+    & ~io_flush;
+  wire        final_has_exc = buf_valid ? buffer_has_exc : pending_has_exc;
   always @(posedge clock or posedge reset) begin
     if (reset) begin
       pc_reg <= 32'h1C000000;
       wait_data_reg <= 1'h0;
+      pending_pc <= 32'h1C000000;
+      pending_has_exc <= 1'h0;
+      pending_ecode <= 6'h0;
+      pending_pred_taken <= 1'h0;
+      pending_pred_target <= 32'h0;
       discard_reg <= 1'h0;
       buf_valid <= 1'h0;
+      inst_buffer <= 32'h0;
+      buffer_pc <= 32'h1C000000;
+      buffer_has_exc <= 1'h0;
+      buffer_ecode <= 6'h0;
+      buffer_pred_taken <= 1'h0;
+      buffer_pred_target <= 32'h0;
     end
     else begin
+      automatic logic req_pred_taken;
+      automatic logic addr_handshaked;
+      automatic logic _GEN = data_handshaked & ~io_out_ready;
+      req_pred_taken = _predictor_io_predictedTaken & ~req_has_exception;
+      addr_handshaked = req_valid & io_inst_sram_addr_ok;
       if (io_flush)
         pc_reg <= io_flush_target_pc;
       else if (addr_handshaked)
-        pc_reg <= pc_reg + 32'h4;
-      wait_data_reg <=
-        ~io_flush & (addr_handshaked | ~(wait_data_reg & real_data_ok) & wait_data_reg);
+        pc_reg <= req_pred_taken ? _predictor_io_predictedTarget : pc_reg + 32'h4;
+      wait_data_reg <= ~io_flush & (addr_handshaked | ~data_handshaked & wait_data_reg);
+      if (addr_handshaked) begin
+        pending_pc <= pc_reg;
+        pending_has_exc <= req_has_exception;
+        pending_ecode <=
+          (|(pc_reg[1:0]))
+            ? 6'h8
+            : exc_tlb_refill_if ? 6'h3F : exc_pif ? 6'h3 : exc_ppi_if ? 6'h7 : 6'h0;
+        pending_pred_taken <= req_pred_taken;
+        pending_pred_target <= _predictor_io_predictedTarget;
+      end
       discard_reg <=
         (wait_data_reg | addr_handshaked) & io_flush & ~io_inst_sram_data_ok
         | ~(discard_reg & io_inst_sram_data_ok) & discard_reg;
-      buf_valid <= ~io_flush & (_GEN | ~io_out_ready & buf_valid);
+      buf_valid <= ~io_flush & (_GEN | ~buffer_consumed & buf_valid);
+      if (io_flush | ~_GEN) begin
+      end
+      else begin
+        inst_buffer <= io_inst_sram_rdata;
+        buffer_pc <= pending_pc;
+        buffer_has_exc <= pending_has_exc;
+        buffer_ecode <= pending_ecode;
+        buffer_pred_taken <= pending_pred_taken;
+        buffer_pred_target <= pending_pred_target;
+      end
     end
   end // always @(posedge, posedge)
-  always @(posedge clock) begin
-    if (io_flush | ~_GEN) begin
-    end
-    else
-      inst_buffer <= io_inst_sram_rdata;
-  end // always @(posedge)
   `ifdef ENABLE_INITIAL_REG_
     `ifdef FIRRTL_BEFORE_INITIAL
       `FIRRTL_BEFORE_INITIAL
@@ -106,26 +154,49 @@ module StageIF(
       if (reset) begin
         pc_reg = 32'h1C000000;
         wait_data_reg = 1'h0;
+        pending_pc = 32'h1C000000;
+        pending_has_exc = 1'h0;
+        pending_ecode = 6'h0;
+        pending_pred_taken = 1'h0;
+        pending_pred_target = 32'h0;
         discard_reg = 1'h0;
         buf_valid = 1'h0;
+        inst_buffer = 32'h0;
+        buffer_pc = 32'h1C000000;
+        buffer_has_exc = 1'h0;
+        buffer_ecode = 6'h0;
+        buffer_pred_taken = 1'h0;
+        buffer_pred_target = 32'h0;
       end
     end // initial
     `ifdef FIRRTL_AFTER_INITIAL
       `FIRRTL_AFTER_INITIAL
     `endif // FIRRTL_AFTER_INITIAL
   `endif // ENABLE_INITIAL_REG_
-  assign io_out_valid = (real_data_ok | buf_valid) & ~io_flush;
-  assign io_out_bits_pc = addr_handshaked ? pc_reg : pc_reg - 32'h4;
+  BranchPredictor predictor (
+    .clock              (clock),
+    .reset              (reset),
+    .io_lookupPc        (pc_reg),
+    .io_predictedTaken  (_predictor_io_predictedTaken),
+    .io_predictedTarget (_predictor_io_predictedTarget),
+    .io_update_valid    (io_bp_update_valid),
+    .io_update_pc       (io_bp_update_pc),
+    .io_update_isBranch (io_bp_update_isBranch),
+    .io_update_taken    (io_bp_update_taken),
+    .io_update_target   (io_bp_update_target)
+  );
+  assign io_out_valid = (data_handshaked | buf_valid) & ~io_flush;
+  assign io_out_bits_pc = buf_valid ? buffer_pc : pending_pc;
   assign io_out_bits_inst =
-    out_data_hasException ? 32'h3400000 : buf_valid ? inst_buffer : io_inst_sram_rdata;
-  assign io_out_bits_hasException = out_data_hasException;
-  assign io_out_bits_ecode =
-    (|_pc_alignment_error_T)
-      ? 6'h8
-      : exc_tlb_refill_if ? 6'h3F : exc_pif ? 6'h3 : exc_ppi_if ? 6'h7 : 6'h0;
+    final_has_exc ? 32'h3400000 : buf_valid ? inst_buffer : io_inst_sram_rdata;
+  assign io_out_bits_predictedTaken = buf_valid ? buffer_pred_taken : pending_pred_taken;
+  assign io_out_bits_predictedTarget =
+    buf_valid ? buffer_pred_target : pending_pred_target;
+  assign io_out_bits_hasException = final_has_exc;
+  assign io_out_bits_ecode = buf_valid ? buffer_ecode : pending_ecode;
   assign io_inst_sram_req = req_valid;
   assign io_inst_sram_addr =
-    out_data_hasException
+    req_has_exception
       ? 32'h1C000000
       : io_mmu_config_crmd_da & ~io_mmu_config_crmd_pg
           ? pc_reg

@@ -36,6 +36,16 @@ class ForwardingData extends Bundle {
     val isCsr        = Bool()
 }
 
+// EX resolves and trains the predictor only when the instruction leaves EX.
+// isBranch=false invalidates a stale BTB entry that predicted a non-branch.
+class BranchPredictorUpdate extends Bundle {
+    val valid    = Bool()
+    val pc       = UInt(32.W)
+    val isBranch = Bool()
+    val taken    = Bool()
+    val target   = UInt(32.W)
+}
+
 
 // 五级流水线唯一的级间载荷。Top.scala 用 Decoupled 将 IF/ID/EX/MEM/WB 串联：
 // valid 表示本级持有一条有效指令，ready 由后级反压；每级内部的 valid_reg/data_reg
@@ -44,6 +54,8 @@ class PipelineData extends Bundle{
     //IF Generated
     val pc              = UInt(32.W)
     val inst            = UInt(32.W)
+    val predictedTaken  = Bool()
+    val predictedTarget = UInt(32.W)
 
     //ID Generated
     //Used in EX

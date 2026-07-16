@@ -6,7 +6,6 @@ Decoder.sv
 StageID.sv
 ALU.sv
 Multiplier.sv
-./div_gen_0.v
 Divider.sv
 StageEX.sv
 StageMEM.sv

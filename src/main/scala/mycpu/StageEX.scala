@@ -8,12 +8,11 @@ class StageEX extends Module {
         val in  = Flipped(Decoupled(new PipelineData()))
         val out = Decoupled(new PipelineData())
 
-        val fwdFromMem = Input(new ForwardingData())
-        val fwdFromWb  = Input(new ForwardingData())
         val fwdOut = Output(new ForwardingData())
 
         val branch_req = Output(Bool())
         val branch_pc  = Output(UInt(32.W))
+        val bp_update  = Output(new BranchPredictorUpdate())
 
         val flush = Input(Bool())
 
@@ -63,7 +62,10 @@ class StageEX extends Module {
     val mdu_busy = RegInit(false.B)
     val mdu_finished = RegInit(false.B)
     val div_done = WireDefault(false.B)
-    val mul_done = RegNext(valid_reg && is_mul && !mdu_busy && !io.flush, false.B) 
+    val mul_start = WireDefault(false.B)
+    val div_start = WireDefault(false.B)
+    val mdu_start = mul_start || div_start
+    val mul_done = RegNext(mul_start, false.B)
 
     val mdu_ready = !is_mdu || mdu_finished || (mdu_busy && (div_done || mul_done))
     val ready_go = Wire(Bool()) //MODDED in AXI experiment
@@ -72,7 +74,7 @@ class StageEX extends Module {
     when(io.flush) {
         mdu_busy := false.B
         mdu_finished := false.B
-    } .elsewhen(valid_reg && is_mdu && !mdu_busy && !mdu_finished) {
+    } .elsewhen(mdu_start) {
         mdu_busy := true.B
     } .elsewhen(mdu_busy && (div_done || mul_done)) {
         mdu_busy := false.B
@@ -92,23 +94,13 @@ class StageEX extends Module {
     when(io.in.valid && allow_in) { data_reg := io.in.bits }
     
 
-    // 前递截止到 EX：优先使用较新的 MEM 结果，其次 WB，最后才是 ID 锁存的寄存器值。
-    // ID 已保证 load/CSR 在结果尚不可用时不会进入本级。
-    val s1_mem_hit = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && (io.fwdFromMem.regWriteAddr === data_reg.src1_addr) && (data_reg.src1_addr =/= 0.U)
-    val s1_wb_hit  = io.fwdFromWb.valid  && io.fwdFromWb.regWriteEn  && (io.fwdFromWb.regWriteAddr === data_reg.src1_addr) && (data_reg.src1_addr =/= 0.U)
-    val s2_mem_hit = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && (io.fwdFromMem.regWriteAddr === data_reg.src2_addr) && (data_reg.src2_addr =/= 0.U)
-    val s2_wb_hit  = io.fwdFromWb.valid  && io.fwdFromWb.regWriteEn  && (io.fwdFromWb.regWriteAddr === data_reg.src2_addr) && (data_reg.src2_addr =/= 0.U)
+    // 前递已在 ID -> EX 边界完成。EX 内只使用本级寄存器中的稳定操作数，
+    // 避免 MEM.destReg 的比较结果继续穿过 ALU、TLB 和 Cache 请求门控。
+    val src1_fwd = data_reg.src1_value
+    val src2_fwd = data_reg.src2_value
 
-    val src1_fwd = MuxCase(data_reg.src1_value, Seq(s1_mem_hit -> io.fwdFromMem.result, s1_wb_hit -> io.fwdFromWb.result))
-    val src2_fwd = MuxCase(data_reg.src2_value, Seq(s2_mem_hit -> io.fwdFromMem.result, s2_wb_hit -> io.fwdFromWb.result))
-
-    when(valid_reg && !allow_in) {
-        data_reg.src1_value := src1_fwd
-        data_reg.src2_value := src2_fwd
-    }
-
-    // 分支在 EX 解析。当前无 predicted_taken/target 元数据：taken 就通知 Ctrl
-    // 重定向并 flush IF/ID，not-taken 则继续使用 IF 已选择的 PC+4。
+    // 分支在 EX 解析。只有方向或目标预测错误才通知 Ctrl 重定向并 flush IF/ID；
+    // 预测正确的 taken 分支不再付出冲刷代价。
     val eq  = (src1_fwd === src2_fwd)
     val lt  = (src1_fwd.asSInt < src2_fwd.asSInt)
     val ltu = (src1_fwd < src2_fwd)
@@ -118,9 +110,28 @@ class StageEX extends Module {
         BrType.BGE  -> !lt,     BrType.BLTU -> ltu,     BrType.BGEU -> !ltu,
         BrType.JIRL -> true.B,  BrType.B   -> true.B,   BrType.BL  -> true.B
     ))
+    val is_branch = data_reg.brType =/= BrType.NOP
     val br_base = Mux(data_reg.brType === BrType.JIRL, src1_fwd, data_reg.pc)
-    io.branch_req := valid_reg && branch_taken && !data_reg.hasException && io.out.ready
-    io.branch_pc  := br_base + data_reg.imm
+    val branch_target = br_base + data_reg.imm
+    val actual_taken = is_branch && branch_taken
+    val resolved_next_pc = Mux(actual_taken, branch_target, data_reg.pc + 4.U)
+
+    // Branches are single-cycle EX operations, but use the common fire condition
+    // so a stalled MEM stage cannot cause repeated redirects or predictor updates.
+    val resolve_fire = valid_reg && ready_go && io.out.ready && !io.flush &&
+                       !data_reg.hasException && !io.mem_has_exc_in
+    val prediction_wrong = (data_reg.predictedTaken =/= actual_taken) ||
+                           (actual_taken && data_reg.predictedTarget =/= branch_target)
+    val prediction_check = is_branch || data_reg.predictedTaken
+
+    io.branch_req := resolve_fire && prediction_check && prediction_wrong
+    io.branch_pc  := resolved_next_pc
+
+    io.bp_update.valid    := resolve_fire && prediction_check
+    io.bp_update.pc       := data_reg.pc
+    io.bp_update.isBranch := is_branch
+    io.bp_update.taken    := actual_taken
+    io.bp_update.target   := branch_target
 
     //ALU
     val alu_src1 = Mux(data_reg.src1IsPC, data_reg.pc, src1_fwd)
@@ -132,8 +143,13 @@ class StageEX extends Module {
     alu.io.src2  := alu_src2
     val alu_res  = alu.io.res
 
+    // load/store/CACOP 的地址形式固定为 rj + sign_extend(imm12)。单独的地址
+    // 加法器使访存关键路径绕过通用 ALU 的操作选择和 12 路结果多路器。
+    val is_mem_addr_op = data_reg.resFromMem || data_reg.memWe || data_reg.is_cacop
+    val mem_va = src1_fwd + data_reg.imm
+
     //MMU
-    val va = alu_res
+    val va = mem_va
 
     val is_tlbsrch = data_reg.tlbOp === TlbOp.SRCH
     val is_invtlb  = data_reg.tlbOp === TlbOp.INV
@@ -182,7 +198,7 @@ class StageEX extends Module {
     val mdu_src1_reg = Reg(UInt(32.W))
     val mdu_src2_reg = Reg(UInt(32.W))
 
-    when(valid_reg && !mdu_busy && !mdu_finished) {
+    when(mdu_start) {
         mdu_src1_reg := src1_fwd
         mdu_src2_reg := src2_fwd
     }
@@ -195,20 +211,28 @@ class StageEX extends Module {
     mul.io.src1     := real_mdu_src1
     mul.io.src2     := real_mdu_src2
     mul.io.isSigned := is_signed_mdu
+    mul_start       := valid_reg && is_mul && !mdu_busy && !mdu_finished && !io.flush
     
     val div = Module(new Divider())
-    val div_src1_abs = Mux(is_signed_mdu && src1_fwd(31), (~src1_fwd + 1.U), real_mdu_src1)
-    val div_src2_abs = Mux(is_signed_mdu && src2_fwd(31), (~src2_fwd + 1.U), real_mdu_src2)
+    val div_src1_abs = Mux(is_signed_mdu && real_mdu_src1(31), (~real_mdu_src1 + 1.U), real_mdu_src1)
+    val div_src2_abs = Mux(is_signed_mdu && real_mdu_src2(31), (~real_mdu_src2 + 1.U), real_mdu_src2)
     
-    div.io.enable := valid_reg && is_div && !mdu_busy && !mdu_finished && !io.flush
+    val div_request = valid_reg && is_div && !mdu_busy && !mdu_finished && !io.flush
+    div.io.enable := div_request
+    div.io.flush  := io.flush
     div.io.a      := div_src1_abs
     div.io.b      := div_src2_abs
+    div_start     := div_request && div.io.ready
     div_done      := div.io.done 
     
     val q_sign = real_mdu_src1(31) ^ real_mdu_src2(31)
     val r_sign = real_mdu_src1(31)
-    val final_q = Mux(is_signed_mdu && q_sign, (~div.io.q + 1.U), div.io.q)
-    val final_r = Mux(is_signed_mdu && r_sign, (~div.io.r + 1.U), div.io.r)
+    val signed_q = Mux(is_signed_mdu && q_sign, (~div.io.q + 1.U), div.io.q)
+    val signed_r = Mux(is_signed_mdu && r_sign, (~div.io.r + 1.U), div.io.r)
+    // 保留原行为级模型的除零约定，并确保负被除数不会在符号后处理时把商改成 1。
+    val divide_by_zero = real_mdu_src2 === 0.U
+    val final_q = Mux(divide_by_zero, "hffffffff".U, signed_q)
+    val final_r = Mux(divide_by_zero, real_mdu_src1, signed_r)
 
     val mdu_res = MuxLookup(data_reg.mduOp, 0.U(32.W))(Seq(
         MduOp.MUL_W   -> mul.io.result64(31, 0),
@@ -227,12 +251,13 @@ class StageEX extends Module {
     // Report no optional cache capability for now.  The NSCSCC startup code
     // will consequently skip CACOP-based I/D/L2 cache initialization.
     val cpucfg_result = 0.U(32.W)
+    val base_ex_result = Mux(is_mem_addr_op, mem_va, alu_res)
     val final_ex_result = Mux(data_reg.isCpucfg, cpucfg_result,
                           Mux(is_tlbsrch, tlbsrch_res,
                           Mux(data_reg.rdtimel, io.timer_in(31, 0),
                           Mux(data_reg.rdtimeh, io.timer_in(63, 32),
                           Mux(data_reg.isCsr, src2_fwd, 
-                          Mux(data_reg.resFromMulDiv, mdu_res, alu_res))))))
+                          Mux(data_reg.resFromMulDiv, mdu_res, base_ex_result))))))
 
     // 强制 tlbsrch 只能修改 TLBIDX 的第 31 位(NE) 和低 4 位(Index)
     val aux_data = Mux(is_tlbsrch, tlbsrch_mask, 
@@ -244,7 +269,7 @@ class StageEX extends Module {
     val isWord = data_reg.lsOp === LsOp.LD_W || data_reg.lsOp === LsOp.ST_W
     val isHalf = data_reg.lsOp === LsOp.LD_H || data_reg.lsOp === LsOp.LD_HU || data_reg.lsOp === LsOp.ST_H
     val ale = (data_reg.resFromMem || data_reg.memWe) && valid_reg && 
-              ((isWord && (alu_res(1, 0) =/= 0.U)) || (isHalf && alu_res(0) === 1.U))
+              ((isWord && (mem_va(1, 0) =/= 0.U)) || (isHalf && mem_va(0) === 1.U))
     // ------------- 新增：EX 级 MMU 访存异常判定 -------------
     val is_mapped = (io.mmu_config.crmd.pg === 1.U) && (io.mmu_config.crmd.da === 0.U) && !dmw_hit
     val is_load   = data_reg.resFromMem && valid_reg && !data_reg.hasException && !ale // 前方无错且是Load
@@ -266,11 +291,12 @@ class StageEX extends Module {
     // 4. 页修改例外 (PME, 0x04)：写操作，页有效且特权级合规，但 D 位(脏位)为 0
     val exc_pme = is_store && is_mapped && io.tlb_s1_found && io.tlb_s1_v && !(exc_ppi_ex) && !io.tlb_s1_d
 
-    val ex_mmu_exc = exc_tlb_refill_ex || exc_ppi_ex || exc_pil || exc_pis || exc_pme
+    // Cache 请求只依赖这个浅层 fault 汇总，不经过异常码编码网络。
+    val mmu_fault = exc_tlb_refill_ex || exc_ppi_ex || exc_pil || exc_pis || exc_pme
     // --------------------------------------------------------
     //MODDED in AXI experiment
     val is_mem_inst = (data_reg.resFromMem || data_reg.memWe || data_reg.is_cacop) && valid_reg && !data_reg.hasException && !ale && !io.mem_has_exc_in
-    val is_mem = is_mem_inst && !ex_mmu_exc
+    val is_mem = is_mem_inst && !mmu_fault
     // 每条访存指令只允许一次 addr_ok 握手。若 MEM/Cache 反压导致 EX 暂留，
     // mem_req_sent 会抑制重复请求，直到该指令真正离开 EX 或被 flush。
     val mem_req_sent = RegInit(false.B)
@@ -282,8 +308,8 @@ class StageEX extends Module {
         mem_req_sent := true.B
     }
     //Read/Write DataMEM
-    val stMaskB = "b0001".U(4.W) << alu_res(1, 0)
-    val stMaskH = Mux(alu_res(1), "b1100".U(4.W), "b0011".U(4.W))
+    val stMaskB = "b0001".U(4.W) << mem_va(1, 0)
+    val stMaskH = Mux(mem_va(1), "b1100".U(4.W), "b0011".U(4.W))
     val stMaskW = "b1111".U(4.W)
 
     io.data_sram.req   := is_mem && !mem_req_sent && io.out.ready && !io.flush
@@ -304,16 +330,19 @@ class StageEX extends Module {
     val out_data = WireDefault(data_reg) 
     out_data.ex_result := final_ex_result
     out_data.aux_data  := aux_data
-    val has_new_exc = ale || ex_mmu_exc
+    val has_new_exc = ale || mmu_fault
     out_data.hasException := data_reg.hasException || has_new_exc
-    // 排定例外码优先级 (前级异常 > ALE > TLBR > PIL/PIS > PPI > PME)
-    out_data.ecode := Mux(data_reg.hasException, data_reg.ecode, 
-                      Mux(ale, "h09".U(6.W),
-                      Mux(exc_tlb_refill_ex, "h3F".U(6.W),
-                      Mux(exc_pil, "h01".U(6.W),
-                      Mux(exc_pis, "h02".U(6.W),
-                      Mux(exc_ppi_ex, "h07".U(6.W),
-                      Mux(exc_pme, "h04".U(6.W), 0.U)))))))
+    // 新产生的异常条件两两互斥：ALE 会禁止 is_load/is_store，TLBR 与
+    // found 类异常互斥，V/PLV/D 条件也已依次排除。按位与/或编码比多层
+    // 优先 Mux 更浅；前级异常仍保持最高优先级。
+    val generated_ecode =
+        (Fill(6, ale)               & "h09".U(6.W)) |
+        (Fill(6, exc_tlb_refill_ex) & "h3F".U(6.W)) |
+        (Fill(6, exc_pil)           & "h01".U(6.W)) |
+        (Fill(6, exc_pis)           & "h02".U(6.W)) |
+        (Fill(6, exc_ppi_ex)        & "h07".U(6.W)) |
+        (Fill(6, exc_pme)           & "h04".U(6.W))
+    out_data.ecode := Mux(data_reg.hasException, data_reg.ecode, generated_ecode)
 
     //MODDED
     val squash_mem = io.mem_has_exc_in
@@ -330,6 +359,11 @@ class StageEX extends Module {
     io.fwdOut.regWriteEn   := data_reg.regWriteEn
     io.fwdOut.regWriteAddr := data_reg.destReg
     io.fwdOut.resFromMem   := data_reg.resFromMem
-    io.fwdOut.result       := DontCare
+    // 只输出能在 EX 真正产生的 GPR 结果。load/CSR 仍由 ID 冒险逻辑等待，
+    // 因而不把 TLB/异常网络重新接回 ID -> EX 旁路路径。
+    io.fwdOut.result       := Mux(data_reg.isCpucfg, cpucfg_result,
+                              Mux(data_reg.rdtimel, io.timer_in(31, 0),
+                              Mux(data_reg.rdtimeh, io.timer_in(63, 32),
+                              Mux(data_reg.resFromMulDiv, mdu_res, alu_res))))
     io.fwdOut.isCsr        := data_reg.isCsr
 }

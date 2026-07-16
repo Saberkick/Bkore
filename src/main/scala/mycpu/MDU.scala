@@ -5,61 +5,24 @@ import chisel3._
 import chisel3.util._
 
 
+// Vivado Divider Generator v5.1 的纯黑盒声明。
+//
+// 这里不能再用 setInline 提供带“/、%”的行为级 Verilog，否则 Vivado 会把它
+// 当作普通 RTL 综合，重新产生一条很长的组合除法路径。工程中必须另外加入
+// 名为 div_gen_0 的 XCI/IP output products；具体配置见 DIVIDER_IP_VIVADO.md。
 class div_gen_0 extends ExtModule {
     val io = FlatIO(new Bundle {
         val aclk                    = Input(Clock())
+        val aresetn                 = Input(Bool())
         val s_axis_divisor_tvalid   = Input(Bool())
+        val s_axis_divisor_tready   = Output(Bool())
         val s_axis_divisor_tdata    = Input(UInt(32.W))
         val s_axis_dividend_tvalid  = Input(Bool())
+        val s_axis_dividend_tready  = Output(Bool())
         val s_axis_dividend_tdata   = Input(UInt(32.W))
         val m_axis_dout_tvalid      = Output(Bool())
         val m_axis_dout_tdata       = Output(UInt(64.W))
     })
-
-    setInline("div_gen_0.v",
-        """module div_gen_0(
-        |  input         aclk,
-        |  input         s_axis_divisor_tvalid,
-        |  input  [31:0] s_axis_divisor_tdata,
-        |  input         s_axis_dividend_tvalid,
-        |  input  [31:0] s_axis_dividend_tdata,
-        |  output        m_axis_dout_tvalid,
-        |  output [63:0] m_axis_dout_tdata
-        |);
-        |  
-        |  reg [33:0] valid_pipe;
-        |  reg [63:0] data_pipe [0:33];
-        |  
-        |  integer i;
-        |  
-        |  initial begin
-        |      valid_pipe = 34'b0;
-        |      for (i = 0; i < 34; i = i + 1) data_pipe[i] = 64'b0;
-        |  end
-        |  
-        |  always @(posedge aclk) begin
-        |      valid_pipe[0] <= s_axis_divisor_tvalid & s_axis_dividend_tvalid;
-        |      
-        |      if (s_axis_divisor_tvalid & s_axis_dividend_tvalid) begin
-        |          if (s_axis_divisor_tdata == 32'b0) begin
-        |              data_pipe[0] <= {32'hffffffff, s_axis_dividend_tdata};
-        |          end else begin
-        |              data_pipe[0] <= { (s_axis_dividend_tdata / s_axis_divisor_tdata), 
-        |                                (s_axis_dividend_tdata % s_axis_divisor_tdata) };
-        |          end
-        |      end
-        |      
-        |      for (i = 1; i < 34; i = i + 1) begin
-        |          valid_pipe[i] <= valid_pipe[i-1];
-        |          data_pipe[i]  <= data_pipe[i-1];
-        |      end
-        |  end
-        |  
-        |  assign m_axis_dout_tvalid = valid_pipe[33];
-        |  assign m_axis_dout_tdata  = data_pipe[33];
-        |  
-        |endmodule
-        |""".stripMargin)
 }
 class Multiplier extends Module {
     val io = IO(new Bundle {
@@ -76,21 +39,92 @@ class Multiplier extends Module {
 class Divider extends Module {
     val io = IO(new Bundle {
         val enable = Input(Bool())
+        val flush  = Input(Bool())
         val a      = Input(UInt(32.W))
         val b      = Input(UInt(32.W))
+        val ready  = Output(Bool())
         val q      = Output(UInt(32.W))
         val r      = Output(UInt(32.W))
         val done   = Output(Bool())
     })
 
     val div_ip = Module(new div_gen_0())
-    div_ip.io.aclk                   := clock
-    div_ip.io.s_axis_dividend_tvalid := io.enable
-    div_ip.io.s_axis_dividend_tdata  := io.a
-    div_ip.io.s_axis_divisor_tvalid  := io.enable
-    div_ip.io.s_axis_divisor_tdata   := io.b
-    
-    io.done := div_ip.io.m_axis_dout_tvalid
-    io.q    := div_ip.io.m_axis_dout_tdata(63, 32)
-    io.r    := div_ip.io.m_axis_dout_tdata(31, 0)
+
+    // Divider Generator 的 ARESETn 是同步、低有效复位，PG151 要求至少保持两拍。
+    // flush 可能只持续一拍，因此额外保持三拍；保持期间不接收新的 CPU 请求。
+    val resetHold = RegInit(3.U(2.W))
+    when(io.flush) {
+        resetHold := 3.U
+    } .elsewhen(resetHold =/= 0.U) {
+        resetHold := resetHold - 1.U
+    }
+    val ipInReset = reset.asBool || io.flush || resetHold.orR
+
+    // Wrapper 只允许一个除法在途。操作数先在本地锁存，再分别遵守两个 AXIS
+    // 输入通道的 ready/valid 握手，因此 IP 采用可变延迟或降低吞吐率也不会丢请求。
+    val active          = RegInit(false.B)
+    val dividendPending = RegInit(false.B)
+    val divisorPending  = RegInit(false.B)
+    val dividendReg     = Reg(UInt(32.W))
+    val divisorReg      = Reg(UInt(32.W))
+
+    io.ready := !active && !ipInReset
+    val accept = io.enable && io.ready
+    val acceptDivideByZero = accept && (io.b === 0.U)
+
+    when(ipInReset) {
+        active          := false.B
+        dividendPending := false.B
+        divisorPending  := false.B
+    } .otherwise {
+        when(accept) {
+            active      := true.B
+            dividendReg := io.a
+            divisorReg  := io.b
+
+            // 除零结果由 wrapper 定义，不把未定义操作送进厂商 IP。
+            dividendPending := io.b =/= 0.U
+            divisorPending  := io.b =/= 0.U
+        }
+
+        when(dividendPending && div_ip.io.s_axis_dividend_tready) {
+            dividendPending := false.B
+        }
+        when(divisorPending && div_ip.io.s_axis_divisor_tready) {
+            divisorPending := false.B
+        }
+    }
+
+    div_ip.io.aclk                    := clock
+    div_ip.io.aresetn                 := !ipInReset
+    div_ip.io.s_axis_dividend_tvalid  := active && dividendPending && !ipInReset
+    div_ip.io.s_axis_dividend_tdata   := dividendReg
+    div_ip.io.s_axis_divisor_tvalid   := active && divisorPending && !ipInReset
+    div_ip.io.s_axis_divisor_tdata    := divisorReg
+
+    // 除零沿用原设计的结果约定：商全 1，余数为被除数，并固定延迟一拍返回。
+    val divideByZeroPending = RegInit(false.B)
+    when(ipInReset) {
+        divideByZeroPending := false.B
+    } .otherwise {
+        divideByZeroPending := acceptDivideByZero
+    }
+
+    val resultValid = divideByZeroPending || div_ip.io.m_axis_dout_tvalid
+    val resultQ = Mux(divideByZeroPending, "hffffffff".U, div_ip.io.m_axis_dout_tdata(63, 32))
+    val resultR = Mux(divideByZeroPending, dividendReg,     div_ip.io.m_axis_dout_tdata(31, 0))
+    val resultFire = active && resultValid && !ipInReset
+
+    // 输出没有 tready，必须在结果脉冲到达时锁存，才能承受 EX/MEM 的反压。
+    val qReg = Reg(UInt(32.W))
+    val rReg = Reg(UInt(32.W))
+    when(resultFire) {
+        qReg   := resultQ
+        rReg   := resultR
+        active := false.B
+    }
+
+    io.done := resultFire
+    io.q    := Mux(resultFire, resultQ, qReg)
+    io.r    := Mux(resultFire, resultR, rReg)
 }

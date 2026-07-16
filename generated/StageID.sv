@@ -6,12 +6,16 @@ module StageID(
   input         io_in_valid,
   input  [31:0] io_in_bits_pc,
                 io_in_bits_inst,
+  input         io_in_bits_predictedTaken,
+  input  [31:0] io_in_bits_predictedTarget,
   input         io_in_bits_hasException,
   input  [5:0]  io_in_bits_ecode,
   input         io_out_ready,
   output        io_out_valid,
   output [31:0] io_out_bits_pc,
                 io_out_bits_inst,
+  output        io_out_bits_predictedTaken,
+  output [31:0] io_out_bits_predictedTarget,
   output [11:0] io_out_bits_aluOp,
   output [6:0]  io_out_bits_mduOp,
   output [8:0]  io_out_bits_brType,
@@ -20,7 +24,6 @@ module StageID(
                 io_out_bits_src2IsImm,
                 io_out_bits_src2IsFour,
   output [4:0]  io_out_bits_src1_addr,
-                io_out_bits_src2_addr,
   output [31:0] io_out_bits_src1_value,
                 io_out_bits_src2_value,
   output        io_out_bits_resFromMulDiv,
@@ -50,11 +53,13 @@ module StageID(
   input         io_fwdFromEx_valid,
                 io_fwdFromEx_regWriteEn,
   input  [4:0]  io_fwdFromEx_regWriteAddr,
+  input  [31:0] io_fwdFromEx_result,
   input         io_fwdFromEx_resFromMem,
                 io_fwdFromEx_isCsr,
                 io_fwdFromMem_valid,
                 io_fwdFromMem_regWriteEn,
   input  [4:0]  io_fwdFromMem_regWriteAddr,
+  input  [31:0] io_fwdFromMem_result,
   input         io_fwdFromMem_resFromMem,
                 io_fwdFromMem_isCsr,
                 io_has_int,
@@ -69,6 +74,8 @@ module StageID(
   reg         valid_reg;
   reg  [31:0] data_reg_pc;
   reg  [31:0] data_reg_inst;
+  reg         data_reg_predictedTaken;
+  reg  [31:0] data_reg_predictedTarget;
   reg         data_reg_hasException;
   reg  [5:0]  data_reg_ecode;
   wire [4:0]  src2_addr =
@@ -81,24 +88,30 @@ module StageID(
   wire        mem_is_csr = io_fwdFromMem_valid & io_fwdFromMem_isCsr;
   wire        _ex_conflict_s2_T =
     io_fwdFromEx_valid & io_fwdFromEx_resFromMem & io_fwdFromEx_regWriteEn | ex_is_csr;
+  wire        _ex_fwd_s1_T_2 = io_fwdFromEx_regWriteAddr == data_reg_inst[9:5];
+  wire        _ex_fwd_s2_T_2 = io_fwdFromEx_regWriteAddr == src2_addr;
   wire        _mem_conflict_s2_T =
     mem_is_csr | io_fwdFromMem_valid & io_fwdFromMem_resFromMem
     & io_fwdFromMem_regWriteEn;
+  wire        _mem_fwd_s1_T_2 = io_fwdFromMem_regWriteAddr == data_reg_inst[9:5];
+  wire        _mem_fwd_s2_T_2 = io_fwdFromMem_regWriteAddr == src2_addr;
   wire        stall =
-    _ex_conflict_s2_T & _decoder_io_out_src1_read
-    & io_fwdFromEx_regWriteAddr == data_reg_inst[9:5] & (|(data_reg_inst[9:5]))
-    | _ex_conflict_s2_T & _decoder_io_out_src2_read
-    & io_fwdFromEx_regWriteAddr == src2_addr & (|src2_addr) | _mem_conflict_s2_T
-    & _decoder_io_out_src1_read & io_fwdFromMem_regWriteAddr == data_reg_inst[9:5]
-    & (|(data_reg_inst[9:5])) | _mem_conflict_s2_T & _decoder_io_out_src2_read
-    & io_fwdFromMem_regWriteAddr == src2_addr & (|src2_addr) | (|_decoder_io_out_tlbOp)
-    & (ex_is_csr | mem_is_csr);
+    _ex_conflict_s2_T & _decoder_io_out_src1_read & _ex_fwd_s1_T_2
+    & (|(data_reg_inst[9:5])) | _ex_conflict_s2_T & _decoder_io_out_src2_read
+    & _ex_fwd_s2_T_2 & (|src2_addr) | _mem_conflict_s2_T & _decoder_io_out_src1_read
+    & _mem_fwd_s1_T_2 & (|(data_reg_inst[9:5])) | _mem_conflict_s2_T
+    & _decoder_io_out_src2_read & _mem_fwd_s2_T_2 & (|src2_addr)
+    | (|_decoder_io_out_tlbOp) & (ex_is_csr | mem_is_csr);
+  wire        _ex_fwd_s2_T = io_fwdFromEx_valid & io_fwdFromEx_regWriteEn;
+  wire        _mem_fwd_s2_T = io_fwdFromMem_valid & io_fwdFromMem_regWriteEn;
   wire        allow_in = ~valid_reg | ~stall & io_out_ready;
   always @(posedge clock or posedge reset) begin
     if (reset) begin
       valid_reg <= 1'h0;
       data_reg_pc <= 32'h0;
       data_reg_inst <= 32'h0;
+      data_reg_predictedTaken <= 1'h0;
+      data_reg_predictedTarget <= 32'h0;
       data_reg_hasException <= 1'h0;
       data_reg_ecode <= 6'h0;
     end
@@ -107,6 +120,8 @@ module StageID(
       if (io_in_valid & allow_in) begin
         data_reg_pc <= io_in_bits_pc;
         data_reg_inst <= io_in_bits_inst;
+        data_reg_predictedTaken <= io_in_bits_predictedTaken;
+        data_reg_predictedTarget <= io_in_bits_predictedTarget;
         data_reg_hasException <= io_in_bits_hasException;
         data_reg_ecode <= io_in_bits_ecode;
       end
@@ -121,6 +136,8 @@ module StageID(
         valid_reg = 1'h0;
         data_reg_pc = 32'h0;
         data_reg_inst = 32'h0;
+        data_reg_predictedTaken = 1'h0;
+        data_reg_predictedTarget = 32'h0;
         data_reg_hasException = 1'h0;
         data_reg_ecode = 6'h0;
       end
@@ -165,10 +182,22 @@ module StageID(
   assign io_out_valid = valid_reg & ~stall & ~io_flush;
   assign io_out_bits_pc = data_reg_pc;
   assign io_out_bits_inst = data_reg_inst;
+  assign io_out_bits_predictedTaken = data_reg_predictedTaken;
+  assign io_out_bits_predictedTarget = data_reg_predictedTarget;
   assign io_out_bits_src1_addr = data_reg_inst[9:5];
-  assign io_out_bits_src2_addr = src2_addr;
-  assign io_out_bits_src1_value = io_rf_rdata1;
-  assign io_out_bits_src2_value = io_rf_rdata2;
+  assign io_out_bits_src1_value =
+    _ex_fwd_s2_T & _decoder_io_out_src1_read & _ex_fwd_s1_T_2 & (|(data_reg_inst[9:5]))
+      ? io_fwdFromEx_result
+      : _mem_fwd_s2_T & _decoder_io_out_src1_read & _mem_fwd_s1_T_2
+        & (|(data_reg_inst[9:5]))
+          ? io_fwdFromMem_result
+          : io_rf_rdata1;
+  assign io_out_bits_src2_value =
+    _ex_fwd_s2_T & _decoder_io_out_src2_read & _ex_fwd_s2_T_2 & (|src2_addr)
+      ? io_fwdFromEx_result
+      : _mem_fwd_s2_T & _decoder_io_out_src2_read & _mem_fwd_s2_T_2 & (|src2_addr)
+          ? io_fwdFromMem_result
+          : io_rf_rdata2;
   assign io_out_bits_hasException =
     io_has_int | data_reg_hasException | _decoder_io_out_hasException;
   assign io_out_bits_ecode =

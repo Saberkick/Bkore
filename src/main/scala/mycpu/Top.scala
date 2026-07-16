@@ -159,6 +159,8 @@ class core_top extends RawModule {
         ctrl.io.wb_flush      := wb_stage.io.wb_flush
         ctrl.io.wb_target_pc  := wb_stage.io.wb_target_pc
 
+        if_stage.io.bp_update := ex_stage.io.bp_update
+
         if_stage.io.flush           := ctrl.io.flush_if
         if_stage.io.flush_target_pc := ctrl.io.next_pc
         id_stage.io.flush           := ctrl.io.flush_id
@@ -167,8 +169,6 @@ class core_top extends RawModule {
 
         id_stage.io.fwdFromEx  := ex_stage.io.fwdOut
         id_stage.io.fwdFromMem := mem_stage.io.fwdOut
-        ex_stage.io.fwdFromMem := mem_stage.io.fwdOut
-        ex_stage.io.fwdFromWb  := wb_stage.io.fwdOut
         ex_stage.io.mem_has_exc_in := mem_stage.io.mem_has_exc_out
 
         id_stage.io.has_int   := wb_stage.io.wb_has_int

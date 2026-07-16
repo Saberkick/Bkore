@@ -21,8 +21,8 @@ class Ctrl extends Module {
         val flush_wb      = Output(Bool())
     })
 
-    // 当前没有分支预测：IF 总是按 PC+4 取指，EX 仅在实际 taken 时请求重定向，
-    // 并清掉年轻的 IF/ID 指令。异常、ERTN、TLB/CSR refetch 到 WB 才确定，
+    // EX 仅在分支方向/目标预测错误时请求重定向，并清掉年轻的 IF/ID 指令。
+    // 异常、ERTN、TLB/CSR refetch 到 WB 才确定，
     // 所以 wb_flush 优先级更高，并额外清空 EX/MEM，保证精确异常。
     val do_flush = io.wb_flush || io.ex_branch_req
     val target_pc = Mux(io.wb_flush, io.wb_target_pc, io.ex_branch_pc)

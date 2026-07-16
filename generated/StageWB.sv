@@ -18,10 +18,6 @@ module StageWB(
   input         io_in_bits_inst_ertn,
   input  [4:0]  io_in_bits_tlbOp,
   input         io_in_bits_is_refetch,
-  output        io_fwdOut_valid,
-                io_fwdOut_regWriteEn,
-  output [4:0]  io_fwdOut_regWriteAddr,
-  output [31:0] io_fwdOut_result,
   output        io_rf_we,
   output [4:0]  io_rf_waddr,
   output [31:0] io_rf_wdata,
@@ -261,10 +257,6 @@ module StageWB(
     .io_tlbidx_out             (_csr_io_tlbidx_out),
     .io_tlbrentryOut           (_csr_io_tlbrentryOut)
   );
-  assign io_fwdOut_valid = valid_reg;
-  assign io_fwdOut_regWriteEn = io_rf_we_0 & ~data_reg_isCsr;
-  assign io_fwdOut_regWriteAddr = data_reg_destReg;
-  assign io_fwdOut_result = data_reg_ex_result;
   assign io_rf_we = io_rf_we_0;
   assign io_rf_waddr = data_reg_destReg;
   assign io_rf_wdata = io_rf_wdata_0;

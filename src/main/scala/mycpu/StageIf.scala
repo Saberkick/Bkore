@@ -10,6 +10,7 @@ class StageIF extends Module {
 
         val flush           = Input(Bool())
         val flush_target_pc = Input(UInt(32.W))
+        val bp_update       = Input(new BranchPredictorUpdate())
         //For mem
         val inst_sram       = new SramIo()
         val inst_uncached   = Output(Bool())
@@ -28,11 +29,16 @@ class StageIF extends Module {
     })
 
     // IF 职责：保存下一取指 PC，完成 DMW/TLB 地址翻译与取指异常判定，
-    // 再通过类 SRAM 握手访问 ICache。wait_data_reg 使前端最多只有一个未完成取指；
+    // 再通过类 SRAM 握手访问 ICache。前端最多保留一个未返回请求，但允许在旧响应
+    // 被 ID 接收的同一拍发出下一地址，从而匹配 ICache 的背靠背命中能力。
     // buf_valid 在 ID 反压时暂存返回指令，discard_reg 丢弃 flush 前已发出的旧响应。
-    // 当前 next PC 只有 PC+4 或 Ctrl 给出的 EX/WB 重定向目标，没有预测路径。
+    // next PC 优先使用命中的 BTB 目标；EX 发现预测错误或 WB flush 时由 Ctrl 重定向。
     val pc_reg = RegInit(Config.START_PC)
     val va = pc_reg
+
+    val predictor = Module(new BranchPredictor(32))
+    predictor.io.lookupPc := va
+    predictor.io.update   := io.bp_update
     //MMU
     io.tlb_s0_vppn     := va(31, 13)
     io.tlb_s0_va_bit12 := va(12)
@@ -78,19 +84,51 @@ class StageIF extends Module {
     // ----------------------------------------------------
 
 
-    //MODDED in AXI experiment
-    val wait_data_reg = RegInit(false.B)
-    val discard_reg   = RegInit(false.B)
-    val buf_valid     = RegInit(false.B)
-    val inst_buffer   = Reg(UInt(32.W))
+    val pc_alignment_error = va(1, 0) =/= 0.U
+    val req_has_exception  = pc_alignment_error || if_mmu_exc
+    val req_ecode = Mux(pc_alignment_error, "h08".U(6.W),
+                    Mux(exc_tlb_refill_if,  "h3F".U(6.W),
+                    Mux(exc_pif,            "h03".U(6.W),
+                    Mux(exc_ppi_if,         "h07".U(6.W), 0.U(6.W)))))
 
-    // 阻塞式取指：地址一旦握手，必须等 data_ok（或 flush 后把旧响应丢弃）才能再发请求。
-    val allow_req = !wait_data_reg && !buf_valid
-    // 1. 删掉 !if_mmu_exc，不管有没有异常，都必须发请求去拿 data_ok
+    // 在途请求的 PC/异常必须随地址握手锁存。背靠背取指后 pc_reg 已经指向
+    // 下一条指令，不能再用 pc_reg - 4 或当前 TLB 输出反推返回数据的属性。
+    val wait_data_reg       = RegInit(false.B)
+    val pending_pc          = RegInit(Config.START_PC)
+    val pending_has_exc     = RegInit(false.B)
+    val pending_ecode       = RegInit(0.U(6.W))
+    val pending_pred_taken  = RegInit(false.B)
+    val pending_pred_target = RegInit(0.U(32.W))
+
+    val discard_reg         = RegInit(false.B)
+    val buf_valid           = RegInit(false.B)
+    val inst_buffer         = RegInit(0.U(32.W))
+    val buffer_pc           = RegInit(Config.START_PC)
+    val buffer_has_exc      = RegInit(false.B)
+    val buffer_ecode        = RegInit(0.U(6.W))
+    val buffer_pred_taken   = RegInit(false.B)
+    val buffer_pred_target  = RegInit(0.U(32.W))
+
+    val real_data_ok        = io.inst_sram.data_ok && !discard_reg
+    val data_handshaked     = wait_data_reg && real_data_ok
+    val response_consumed   = data_handshaked && io.out.ready
+    val buffer_consumed     = buf_valid && io.out.ready
+
+    // 仍然最多只有一个未返回请求；当旧响应本拍能送入 ID 时，请求槽在
+    // 同一拍释放，因而可与 ICache 的 data_ok/addr_ok 同拍握手下一个 PC。
+    // 若 ID 反压，返回数据先进 buffer，在 buffer 被消费前不再接收新响应。
+    val request_slot_available = !wait_data_reg || response_consumed
+    val output_slot_available  = !buf_valid || buffer_consumed
+    val allow_req = request_slot_available && output_slot_available
     val req_valid = allow_req && !io.flush
-    val pc_alignment_error = WireDefault(false.B)
-    // 2. 如果发生 MMU 异常，强行去一个合法的安全物理地址（例如复位地址）借一个data_ok
-    val safe_pa = Mux(pc_alignment_error || if_mmu_exc, "h1c000000".U(32.W), pa)
+
+    // Do not speculate through an IF exception.  The exception instruction is
+    // still fetched from safe_pa and later redirects through the precise WB path.
+    val req_pred_taken  = predictor.io.predictedTaken && !req_has_exception
+    val req_pred_target = predictor.io.predictedTarget
+
+    // 取指异常仍向一个安全物理地址发请求，借用正常 data_ok 时序将异常送入流水线。
+    val safe_pa = Mux(req_has_exception, "h1c000000".U(32.W), pa)
 
     io.inst_sram.req    := req_valid
     io.inst_sram.wr     := false.B
@@ -102,15 +140,11 @@ class StageIF extends Module {
     val addr_handshaked = req_valid && io.inst_sram.addr_ok
 
     val set_discard = (wait_data_reg || addr_handshaked) && io.flush && !io.inst_sram.data_ok
-    val real_data_ok = io.inst_sram.data_ok && !discard_reg
-    val data_handshaked = wait_data_reg && real_data_ok
-
-    val next_pc = Mux(io.flush, io.flush_target_pc - 4.U, pc_reg + 4.U)
 
     when(io.flush) {
         pc_reg := io.flush_target_pc
     } .elsewhen(addr_handshaked) {
-        pc_reg := pc_reg + 4.U
+        pc_reg := Mux(req_pred_taken, req_pred_target, pc_reg + 4.U)
     }
 
     when(io.flush) {
@@ -119,6 +153,14 @@ class StageIF extends Module {
         wait_data_reg := true.B
     } .elsewhen(data_handshaked) {
         wait_data_reg := false.B
+    }
+
+    when(addr_handshaked) {
+        pending_pc      := va
+        pending_has_exc := req_has_exception
+        pending_ecode   := req_ecode
+        pending_pred_taken  := req_pred_taken
+        pending_pred_target := req_pred_target
     }
 
     
@@ -131,29 +173,36 @@ class StageIF extends Module {
     
     when(io.flush) {
         buf_valid := false.B
-    } .elsewhen(real_data_ok && !io.out.ready) {
-        inst_buffer := io.inst_sram.rdata
-        buf_valid   := true.B
-    } .elsewhen(io.out.ready) {
+    } .elsewhen(data_handshaked && !io.out.ready) {
+        inst_buffer    := io.inst_sram.rdata
+        buffer_pc      := pending_pc
+        buffer_has_exc := pending_has_exc
+        buffer_ecode   := pending_ecode
+        buffer_pred_taken  := pending_pred_taken
+        buffer_pred_target := pending_pred_target
+        buf_valid      := true.B
+    } .elsewhen(buffer_consumed) {
         buf_valid   := false.B
     }
 
-    val current_pc  = Mux(addr_handshaked, pc_reg, pc_reg - 4.U)
-    val final_inst  = Mux(buf_valid, inst_buffer, io.inst_sram.rdata)
-    val final_valid = (real_data_ok || buf_valid) && !io.flush
+    val final_pc      = Mux(buf_valid, buffer_pc, pending_pc)
+    val final_inst    = Mux(buf_valid, inst_buffer, io.inst_sram.rdata)
+    val final_has_exc = Mux(buf_valid, buffer_has_exc, pending_has_exc)
+    val final_ecode   = Mux(buf_valid, buffer_ecode, pending_ecode)
+    val final_pred_taken  = Mux(buf_valid, buffer_pred_taken, pending_pred_taken)
+    val final_pred_target = Mux(buf_valid, buffer_pred_target, pending_pred_target)
+    val final_valid   = (data_handshaked || buf_valid) && !io.flush
 
-    pc_alignment_error := (va(1, 0) =/= 0.U)
-    // 4. 只要发生任何 IF 级异常，一律把取回来的数据抹成 NOP 指令
-    val safe_inst = Mux(pc_alignment_error || if_mmu_exc, "h03400000".U(32.W), final_inst)
+    // 只要发生任何 IF 级异常，一律把取回来的数据抹成 NOP 指令。
+    val safe_inst = Mux(final_has_exc, "h03400000".U(32.W), final_inst)
 
     val out_data = WireDefault(0.U.asTypeOf(new PipelineData()))
-    out_data.pc           := current_pc
+    out_data.pc           := final_pc
     out_data.inst         := safe_inst
-    out_data.hasException := pc_alignment_error || if_mmu_exc
-    out_data.ecode        := Mux(pc_alignment_error, "h08".U(6.W),
-                             Mux(exc_tlb_refill_if,  "h3F".U(6.W),
-                             Mux(exc_pif,            "h03".U(6.W),
-                             Mux(exc_ppi_if,         "h07".U(6.W), 0.U(6.W)))))
+    out_data.predictedTaken  := final_pred_taken
+    out_data.predictedTarget := final_pred_target
+    out_data.hasException := final_has_exc
+    out_data.ecode        := final_ecode
     
     io.out.bits  := out_data
     io.out.valid := final_valid

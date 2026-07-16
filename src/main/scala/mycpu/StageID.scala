@@ -58,6 +58,24 @@ class StageID extends Module {
     val mem_conflict_s2 = (mem_is_csr || mem_is_load) && dec.src2_read && (io.fwdFromMem.regWriteAddr === src2_addr) && (src2_addr =/= 0.U)
 
     val stall = ex_conflict_s1 || ex_conflict_s2 || mem_conflict_s1 || mem_conflict_s2 || csr_hazard
+
+    // 在 ID -> EX 流水寄存器之前完成旁路选择。这样相关指令进入 EX 后，
+    // 操作数已经稳定，不再需要用当前 MEM/WB 的 destReg 驱动 EX 地址计算、
+    // TLB 查询和异常判断。EX 优先于 MEM；WB 同拍写回由 Regfile 的
+    // write-first 旁路覆盖。
+    val ex_fwd_s1 = io.fwdFromEx.valid && io.fwdFromEx.regWriteEn && dec.src1_read &&
+                    (io.fwdFromEx.regWriteAddr === src1_addr) && (src1_addr =/= 0.U)
+    val ex_fwd_s2 = io.fwdFromEx.valid && io.fwdFromEx.regWriteEn && dec.src2_read &&
+                    (io.fwdFromEx.regWriteAddr === src2_addr) && (src2_addr =/= 0.U)
+    val mem_fwd_s1 = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && dec.src1_read &&
+                     (io.fwdFromMem.regWriteAddr === src1_addr) && (src1_addr =/= 0.U)
+    val mem_fwd_s2 = io.fwdFromMem.valid && io.fwdFromMem.regWriteEn && dec.src2_read &&
+                     (io.fwdFromMem.regWriteAddr === src2_addr) && (src2_addr =/= 0.U)
+
+    val resolved_src1 = Mux(ex_fwd_s1, io.fwdFromEx.result,
+                        Mux(mem_fwd_s1, io.fwdFromMem.result, io.rf_rdata1))
+    val resolved_src2 = Mux(ex_fwd_s2, io.fwdFromEx.result,
+                        Mux(mem_fwd_s2, io.fwdFromMem.result, io.rf_rdata2))
     
     // 标准弹性流水级：空级可收数据；本级完成且下级 ready 时可同拍“出旧进新”。
     // stall 拉低 ready_go 后，反压会沿 EX <- ID <- IF 一直传播。
@@ -95,8 +113,10 @@ class StageID extends Module {
     
     out_data.src1_addr     := src1_addr
     out_data.src2_addr     := src2_addr
-    out_data.src1_value    := io.rf_rdata1
-    out_data.src2_value    := io.rf_rdata2
+    // 只有 ready_go && io.out.ready 时这些值才会被 EX 锁存。若前方是
+    // load/CSR，原有 stall 会一直保持，直到能从 WB/Regfile 得到真实结果。
+    out_data.src1_value    := resolved_src1
+    out_data.src2_value    := resolved_src2
 
     val exc_int = io.has_int
     out_data.hasException  := exc_int || data_reg.hasException || dec.hasException

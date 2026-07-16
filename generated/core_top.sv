@@ -106,10 +106,6 @@ module core_top(
   wire         _bridge_io_data_cache_ret_last;
   wire [31:0]  _bridge_io_data_cache_ret_data;
   wire         _bridge_io_data_cache_wr_rdy;
-  wire         _wb_stage_io_fwdOut_valid;
-  wire         _wb_stage_io_fwdOut_regWriteEn;
-  wire [4:0]   _wb_stage_io_fwdOut_regWriteAddr;
-  wire [31:0]  _wb_stage_io_fwdOut_result;
   wire         _wb_stage_io_rf_we;
   wire [4:0]   _wb_stage_io_rf_waddr;
   wire [31:0]  _wb_stage_io_rf_wdata;
@@ -203,10 +199,16 @@ module core_top(
   wire         _ex_stage_io_fwdOut_valid;
   wire         _ex_stage_io_fwdOut_regWriteEn;
   wire [4:0]   _ex_stage_io_fwdOut_regWriteAddr;
+  wire [31:0]  _ex_stage_io_fwdOut_result;
   wire         _ex_stage_io_fwdOut_resFromMem;
   wire         _ex_stage_io_fwdOut_isCsr;
   wire         _ex_stage_io_branch_req;
   wire [31:0]  _ex_stage_io_branch_pc;
+  wire         _ex_stage_io_bp_update_valid;
+  wire [31:0]  _ex_stage_io_bp_update_pc;
+  wire         _ex_stage_io_bp_update_isBranch;
+  wire         _ex_stage_io_bp_update_taken;
+  wire [31:0]  _ex_stage_io_bp_update_target;
   wire         _ex_stage_io_data_sram_req;
   wire         _ex_stage_io_data_sram_wr;
   wire [3:0]   _ex_stage_io_data_sram_wstrb;
@@ -222,6 +224,8 @@ module core_top(
   wire         _id_stage_io_out_valid;
   wire [31:0]  _id_stage_io_out_bits_pc;
   wire [31:0]  _id_stage_io_out_bits_inst;
+  wire         _id_stage_io_out_bits_predictedTaken;
+  wire [31:0]  _id_stage_io_out_bits_predictedTarget;
   wire [11:0]  _id_stage_io_out_bits_aluOp;
   wire [6:0]   _id_stage_io_out_bits_mduOp;
   wire [8:0]   _id_stage_io_out_bits_brType;
@@ -230,7 +234,6 @@ module core_top(
   wire         _id_stage_io_out_bits_src2IsImm;
   wire         _id_stage_io_out_bits_src2IsFour;
   wire [4:0]   _id_stage_io_out_bits_src1_addr;
-  wire [4:0]   _id_stage_io_out_bits_src2_addr;
   wire [31:0]  _id_stage_io_out_bits_src1_value;
   wire [31:0]  _id_stage_io_out_bits_src2_value;
   wire         _id_stage_io_out_bits_resFromMulDiv;
@@ -258,6 +261,8 @@ module core_top(
   wire         _if_stage_io_out_valid;
   wire [31:0]  _if_stage_io_out_bits_pc;
   wire [31:0]  _if_stage_io_out_bits_inst;
+  wire         _if_stage_io_out_bits_predictedTaken;
+  wire [31:0]  _if_stage_io_out_bits_predictedTarget;
   wire         _if_stage_io_out_bits_hasException;
   wire [5:0]   _if_stage_io_out_bits_ecode;
   wire         _if_stage_io_inst_sram_req;
@@ -318,108 +323,120 @@ module core_top(
     .io_wdata  (_wb_stage_io_rf_wdata)
   );
   StageIF if_stage (
-    .clock                    (aclk),
-    .reset                    (~aresetn),
-    .io_out_ready             (_id_stage_io_in_ready),
-    .io_out_valid             (_if_stage_io_out_valid),
-    .io_out_bits_pc           (_if_stage_io_out_bits_pc),
-    .io_out_bits_inst         (_if_stage_io_out_bits_inst),
-    .io_out_bits_hasException (_if_stage_io_out_bits_hasException),
-    .io_out_bits_ecode        (_if_stage_io_out_bits_ecode),
-    .io_flush                 (_ctrl_io_flush_if),
-    .io_flush_target_pc       (_ctrl_io_next_pc),
-    .io_inst_sram_req         (_if_stage_io_inst_sram_req),
-    .io_inst_sram_addr        (_if_stage_io_inst_sram_addr),
+    .clock                       (aclk),
+    .reset                       (~aresetn),
+    .io_out_ready                (_id_stage_io_in_ready),
+    .io_out_valid                (_if_stage_io_out_valid),
+    .io_out_bits_pc              (_if_stage_io_out_bits_pc),
+    .io_out_bits_inst            (_if_stage_io_out_bits_inst),
+    .io_out_bits_predictedTaken  (_if_stage_io_out_bits_predictedTaken),
+    .io_out_bits_predictedTarget (_if_stage_io_out_bits_predictedTarget),
+    .io_out_bits_hasException    (_if_stage_io_out_bits_hasException),
+    .io_out_bits_ecode           (_if_stage_io_out_bits_ecode),
+    .io_flush                    (_ctrl_io_flush_if),
+    .io_flush_target_pc          (_ctrl_io_next_pc),
+    .io_bp_update_valid          (_ex_stage_io_bp_update_valid),
+    .io_bp_update_pc             (_ex_stage_io_bp_update_pc),
+    .io_bp_update_isBranch       (_ex_stage_io_bp_update_isBranch),
+    .io_bp_update_taken          (_ex_stage_io_bp_update_taken),
+    .io_bp_update_target         (_ex_stage_io_bp_update_target),
+    .io_inst_sram_req            (_if_stage_io_inst_sram_req),
+    .io_inst_sram_addr           (_if_stage_io_inst_sram_addr),
     .io_inst_sram_addr_ok
       (_icache_io_cpu_addr_ok & ~ex_is_icache_cacop & ~mem_is_icache_cacop),
-    .io_inst_sram_data_ok     (_icache_io_cpu_data_ok & ~mem_is_icache_cacop),
-    .io_inst_sram_rdata       (_icache_io_cpu_rdata),
-    .io_inst_uncached         (_if_stage_io_inst_uncached),
-    .io_mmu_config_crmd_datf  (_wb_stage_io_mmu_config_crmd_datf),
-    .io_mmu_config_crmd_pg    (_wb_stage_io_mmu_config_crmd_pg),
-    .io_mmu_config_crmd_da    (_wb_stage_io_mmu_config_crmd_da),
-    .io_mmu_config_crmd_plv   (_wb_stage_io_mmu_config_crmd_plv),
-    .io_mmu_config_asid_asid  (_wb_stage_io_mmu_config_asid_asid),
-    .io_mmu_config_dmw0_vseg  (_wb_stage_io_mmu_config_dmw0_vseg),
-    .io_mmu_config_dmw0_pseg  (_wb_stage_io_mmu_config_dmw0_pseg),
-    .io_mmu_config_dmw0_mat   (_wb_stage_io_mmu_config_dmw0_mat),
-    .io_mmu_config_dmw0_plv3  (_wb_stage_io_mmu_config_dmw0_plv3),
-    .io_mmu_config_dmw0_plv0  (_wb_stage_io_mmu_config_dmw0_plv0),
-    .io_mmu_config_dmw1_vseg  (_wb_stage_io_mmu_config_dmw1_vseg),
-    .io_mmu_config_dmw1_pseg  (_wb_stage_io_mmu_config_dmw1_pseg),
-    .io_mmu_config_dmw1_mat   (_wb_stage_io_mmu_config_dmw1_mat),
-    .io_mmu_config_dmw1_plv3  (_wb_stage_io_mmu_config_dmw1_plv3),
-    .io_mmu_config_dmw1_plv0  (_wb_stage_io_mmu_config_dmw1_plv0),
-    .io_tlb_s0_vppn           (_if_stage_io_tlb_s0_vppn),
-    .io_tlb_s0_va_bit12       (_if_stage_io_tlb_s0_va_bit12),
-    .io_tlb_s0_asid           (_if_stage_io_tlb_s0_asid),
-    .io_tlb_s0_found          (_tlb_module_io_s0_found),
-    .io_tlb_s0_ppn            (_tlb_module_io_s0_ppn),
-    .io_tlb_s0_ps             (_tlb_module_io_s0_ps),
-    .io_tlb_s0_plv            (_tlb_module_io_s0_plv),
-    .io_tlb_s0_mat            (_tlb_module_io_s0_mat),
-    .io_tlb_s0_v              (_tlb_module_io_s0_v)
+    .io_inst_sram_data_ok        (_icache_io_cpu_data_ok & ~mem_is_icache_cacop),
+    .io_inst_sram_rdata          (_icache_io_cpu_rdata),
+    .io_inst_uncached            (_if_stage_io_inst_uncached),
+    .io_mmu_config_crmd_datf     (_wb_stage_io_mmu_config_crmd_datf),
+    .io_mmu_config_crmd_pg       (_wb_stage_io_mmu_config_crmd_pg),
+    .io_mmu_config_crmd_da       (_wb_stage_io_mmu_config_crmd_da),
+    .io_mmu_config_crmd_plv      (_wb_stage_io_mmu_config_crmd_plv),
+    .io_mmu_config_asid_asid     (_wb_stage_io_mmu_config_asid_asid),
+    .io_mmu_config_dmw0_vseg     (_wb_stage_io_mmu_config_dmw0_vseg),
+    .io_mmu_config_dmw0_pseg     (_wb_stage_io_mmu_config_dmw0_pseg),
+    .io_mmu_config_dmw0_mat      (_wb_stage_io_mmu_config_dmw0_mat),
+    .io_mmu_config_dmw0_plv3     (_wb_stage_io_mmu_config_dmw0_plv3),
+    .io_mmu_config_dmw0_plv0     (_wb_stage_io_mmu_config_dmw0_plv0),
+    .io_mmu_config_dmw1_vseg     (_wb_stage_io_mmu_config_dmw1_vseg),
+    .io_mmu_config_dmw1_pseg     (_wb_stage_io_mmu_config_dmw1_pseg),
+    .io_mmu_config_dmw1_mat      (_wb_stage_io_mmu_config_dmw1_mat),
+    .io_mmu_config_dmw1_plv3     (_wb_stage_io_mmu_config_dmw1_plv3),
+    .io_mmu_config_dmw1_plv0     (_wb_stage_io_mmu_config_dmw1_plv0),
+    .io_tlb_s0_vppn              (_if_stage_io_tlb_s0_vppn),
+    .io_tlb_s0_va_bit12          (_if_stage_io_tlb_s0_va_bit12),
+    .io_tlb_s0_asid              (_if_stage_io_tlb_s0_asid),
+    .io_tlb_s0_found             (_tlb_module_io_s0_found),
+    .io_tlb_s0_ppn               (_tlb_module_io_s0_ppn),
+    .io_tlb_s0_ps                (_tlb_module_io_s0_ps),
+    .io_tlb_s0_plv               (_tlb_module_io_s0_plv),
+    .io_tlb_s0_mat               (_tlb_module_io_s0_mat),
+    .io_tlb_s0_v                 (_tlb_module_io_s0_v)
   );
   StageID id_stage (
-    .clock                      (aclk),
-    .reset                      (~aresetn),
-    .io_in_ready                (_id_stage_io_in_ready),
-    .io_in_valid                (_if_stage_io_out_valid),
-    .io_in_bits_pc              (_if_stage_io_out_bits_pc),
-    .io_in_bits_inst            (_if_stage_io_out_bits_inst),
-    .io_in_bits_hasException    (_if_stage_io_out_bits_hasException),
-    .io_in_bits_ecode           (_if_stage_io_out_bits_ecode),
-    .io_out_ready               (_ex_stage_io_in_ready),
-    .io_out_valid               (_id_stage_io_out_valid),
-    .io_out_bits_pc             (_id_stage_io_out_bits_pc),
-    .io_out_bits_inst           (_id_stage_io_out_bits_inst),
-    .io_out_bits_aluOp          (_id_stage_io_out_bits_aluOp),
-    .io_out_bits_mduOp          (_id_stage_io_out_bits_mduOp),
-    .io_out_bits_brType         (_id_stage_io_out_bits_brType),
-    .io_out_bits_imm            (_id_stage_io_out_bits_imm),
-    .io_out_bits_src1IsPC       (_id_stage_io_out_bits_src1IsPC),
-    .io_out_bits_src2IsImm      (_id_stage_io_out_bits_src2IsImm),
-    .io_out_bits_src2IsFour     (_id_stage_io_out_bits_src2IsFour),
-    .io_out_bits_src1_addr      (_id_stage_io_out_bits_src1_addr),
-    .io_out_bits_src2_addr      (_id_stage_io_out_bits_src2_addr),
-    .io_out_bits_src1_value     (_id_stage_io_out_bits_src1_value),
-    .io_out_bits_src2_value     (_id_stage_io_out_bits_src2_value),
-    .io_out_bits_resFromMulDiv  (_id_stage_io_out_bits_resFromMulDiv),
-    .io_out_bits_memWe          (_id_stage_io_out_bits_memWe),
-    .io_out_bits_lsOp           (_id_stage_io_out_bits_lsOp),
-    .io_out_bits_resFromMem     (_id_stage_io_out_bits_resFromMem),
-    .io_out_bits_regWriteEn     (_id_stage_io_out_bits_regWriteEn),
-    .io_out_bits_destReg        (_id_stage_io_out_bits_destReg),
-    .io_out_bits_hasException   (_id_stage_io_out_bits_hasException),
-    .io_out_bits_ecode          (_id_stage_io_out_bits_ecode),
-    .io_out_bits_isCsr          (_id_stage_io_out_bits_isCsr),
-    .io_out_bits_csrWe          (_id_stage_io_out_bits_csrWe),
-    .io_out_bits_csrNum         (_id_stage_io_out_bits_csrNum),
-    .io_out_bits_inst_ertn      (_id_stage_io_out_bits_inst_ertn),
-    .io_out_bits_rdtimel        (_id_stage_io_out_bits_rdtimel),
-    .io_out_bits_rdtimeh        (_id_stage_io_out_bits_rdtimeh),
-    .io_out_bits_isCpucfg       (_id_stage_io_out_bits_isCpucfg),
-    .io_out_bits_tlbOp          (_id_stage_io_out_bits_tlbOp),
-    .io_out_bits_invtlb_op      (_id_stage_io_out_bits_invtlb_op),
-    .io_out_bits_is_refetch     (_id_stage_io_out_bits_is_refetch),
-    .io_out_bits_is_cacop       (_id_stage_io_out_bits_is_cacop),
-    .io_out_bits_cacop_op       (_id_stage_io_out_bits_cacop_op),
-    .io_rf_raddr1               (_id_stage_io_rf_raddr1),
-    .io_rf_rdata1               (_regfile_io_rdata1),
-    .io_rf_raddr2               (_id_stage_io_rf_raddr2),
-    .io_rf_rdata2               (_regfile_io_rdata2),
-    .io_fwdFromEx_valid         (_ex_stage_io_fwdOut_valid),
-    .io_fwdFromEx_regWriteEn    (_ex_stage_io_fwdOut_regWriteEn),
-    .io_fwdFromEx_regWriteAddr  (_ex_stage_io_fwdOut_regWriteAddr),
-    .io_fwdFromEx_resFromMem    (_ex_stage_io_fwdOut_resFromMem),
-    .io_fwdFromEx_isCsr         (_ex_stage_io_fwdOut_isCsr),
-    .io_fwdFromMem_valid        (_mem_stage_io_fwdOut_valid),
-    .io_fwdFromMem_regWriteEn   (_mem_stage_io_fwdOut_regWriteEn),
-    .io_fwdFromMem_regWriteAddr (_mem_stage_io_fwdOut_regWriteAddr),
-    .io_fwdFromMem_resFromMem   (_mem_stage_io_fwdOut_resFromMem),
-    .io_fwdFromMem_isCsr        (_mem_stage_io_fwdOut_isCsr),
-    .io_has_int                 (_wb_stage_io_wb_has_int),
-    .io_flush                   (_ctrl_io_flush_id)
+    .clock                       (aclk),
+    .reset                       (~aresetn),
+    .io_in_ready                 (_id_stage_io_in_ready),
+    .io_in_valid                 (_if_stage_io_out_valid),
+    .io_in_bits_pc               (_if_stage_io_out_bits_pc),
+    .io_in_bits_inst             (_if_stage_io_out_bits_inst),
+    .io_in_bits_predictedTaken   (_if_stage_io_out_bits_predictedTaken),
+    .io_in_bits_predictedTarget  (_if_stage_io_out_bits_predictedTarget),
+    .io_in_bits_hasException     (_if_stage_io_out_bits_hasException),
+    .io_in_bits_ecode            (_if_stage_io_out_bits_ecode),
+    .io_out_ready                (_ex_stage_io_in_ready),
+    .io_out_valid                (_id_stage_io_out_valid),
+    .io_out_bits_pc              (_id_stage_io_out_bits_pc),
+    .io_out_bits_inst            (_id_stage_io_out_bits_inst),
+    .io_out_bits_predictedTaken  (_id_stage_io_out_bits_predictedTaken),
+    .io_out_bits_predictedTarget (_id_stage_io_out_bits_predictedTarget),
+    .io_out_bits_aluOp           (_id_stage_io_out_bits_aluOp),
+    .io_out_bits_mduOp           (_id_stage_io_out_bits_mduOp),
+    .io_out_bits_brType          (_id_stage_io_out_bits_brType),
+    .io_out_bits_imm             (_id_stage_io_out_bits_imm),
+    .io_out_bits_src1IsPC        (_id_stage_io_out_bits_src1IsPC),
+    .io_out_bits_src2IsImm       (_id_stage_io_out_bits_src2IsImm),
+    .io_out_bits_src2IsFour      (_id_stage_io_out_bits_src2IsFour),
+    .io_out_bits_src1_addr       (_id_stage_io_out_bits_src1_addr),
+    .io_out_bits_src1_value      (_id_stage_io_out_bits_src1_value),
+    .io_out_bits_src2_value      (_id_stage_io_out_bits_src2_value),
+    .io_out_bits_resFromMulDiv   (_id_stage_io_out_bits_resFromMulDiv),
+    .io_out_bits_memWe           (_id_stage_io_out_bits_memWe),
+    .io_out_bits_lsOp            (_id_stage_io_out_bits_lsOp),
+    .io_out_bits_resFromMem      (_id_stage_io_out_bits_resFromMem),
+    .io_out_bits_regWriteEn      (_id_stage_io_out_bits_regWriteEn),
+    .io_out_bits_destReg         (_id_stage_io_out_bits_destReg),
+    .io_out_bits_hasException    (_id_stage_io_out_bits_hasException),
+    .io_out_bits_ecode           (_id_stage_io_out_bits_ecode),
+    .io_out_bits_isCsr           (_id_stage_io_out_bits_isCsr),
+    .io_out_bits_csrWe           (_id_stage_io_out_bits_csrWe),
+    .io_out_bits_csrNum          (_id_stage_io_out_bits_csrNum),
+    .io_out_bits_inst_ertn       (_id_stage_io_out_bits_inst_ertn),
+    .io_out_bits_rdtimel         (_id_stage_io_out_bits_rdtimel),
+    .io_out_bits_rdtimeh         (_id_stage_io_out_bits_rdtimeh),
+    .io_out_bits_isCpucfg        (_id_stage_io_out_bits_isCpucfg),
+    .io_out_bits_tlbOp           (_id_stage_io_out_bits_tlbOp),
+    .io_out_bits_invtlb_op       (_id_stage_io_out_bits_invtlb_op),
+    .io_out_bits_is_refetch      (_id_stage_io_out_bits_is_refetch),
+    .io_out_bits_is_cacop        (_id_stage_io_out_bits_is_cacop),
+    .io_out_bits_cacop_op        (_id_stage_io_out_bits_cacop_op),
+    .io_rf_raddr1                (_id_stage_io_rf_raddr1),
+    .io_rf_rdata1                (_regfile_io_rdata1),
+    .io_rf_raddr2                (_id_stage_io_rf_raddr2),
+    .io_rf_rdata2                (_regfile_io_rdata2),
+    .io_fwdFromEx_valid          (_ex_stage_io_fwdOut_valid),
+    .io_fwdFromEx_regWriteEn     (_ex_stage_io_fwdOut_regWriteEn),
+    .io_fwdFromEx_regWriteAddr   (_ex_stage_io_fwdOut_regWriteAddr),
+    .io_fwdFromEx_result         (_ex_stage_io_fwdOut_result),
+    .io_fwdFromEx_resFromMem     (_ex_stage_io_fwdOut_resFromMem),
+    .io_fwdFromEx_isCsr          (_ex_stage_io_fwdOut_isCsr),
+    .io_fwdFromMem_valid         (_mem_stage_io_fwdOut_valid),
+    .io_fwdFromMem_regWriteEn    (_mem_stage_io_fwdOut_regWriteEn),
+    .io_fwdFromMem_regWriteAddr  (_mem_stage_io_fwdOut_regWriteAddr),
+    .io_fwdFromMem_result        (_mem_stage_io_fwdOut_result),
+    .io_fwdFromMem_resFromMem    (_mem_stage_io_fwdOut_resFromMem),
+    .io_fwdFromMem_isCsr         (_mem_stage_io_fwdOut_isCsr),
+    .io_has_int                  (_wb_stage_io_wb_has_int),
+    .io_flush                    (_ctrl_io_flush_id)
   );
   StageEX ex_stage (
     .clock                      (aclk),
@@ -428,6 +445,8 @@ module core_top(
     .io_in_valid                (_id_stage_io_out_valid),
     .io_in_bits_pc              (_id_stage_io_out_bits_pc),
     .io_in_bits_inst            (_id_stage_io_out_bits_inst),
+    .io_in_bits_predictedTaken  (_id_stage_io_out_bits_predictedTaken),
+    .io_in_bits_predictedTarget (_id_stage_io_out_bits_predictedTarget),
     .io_in_bits_aluOp           (_id_stage_io_out_bits_aluOp),
     .io_in_bits_mduOp           (_id_stage_io_out_bits_mduOp),
     .io_in_bits_brType          (_id_stage_io_out_bits_brType),
@@ -436,7 +455,6 @@ module core_top(
     .io_in_bits_src2IsImm       (_id_stage_io_out_bits_src2IsImm),
     .io_in_bits_src2IsFour      (_id_stage_io_out_bits_src2IsFour),
     .io_in_bits_src1_addr       (_id_stage_io_out_bits_src1_addr),
-    .io_in_bits_src2_addr       (_id_stage_io_out_bits_src2_addr),
     .io_in_bits_src1_value      (_id_stage_io_out_bits_src1_value),
     .io_in_bits_src2_value      (_id_stage_io_out_bits_src2_value),
     .io_in_bits_resFromMulDiv   (_id_stage_io_out_bits_resFromMulDiv),
@@ -480,21 +498,19 @@ module core_top(
     .io_out_bits_is_refetch     (_ex_stage_io_out_bits_is_refetch),
     .io_out_bits_is_cacop       (_ex_stage_io_out_bits_is_cacop),
     .io_out_bits_cacop_op       (_ex_stage_io_out_bits_cacop_op),
-    .io_fwdFromMem_valid        (_mem_stage_io_fwdOut_valid),
-    .io_fwdFromMem_regWriteEn   (_mem_stage_io_fwdOut_regWriteEn),
-    .io_fwdFromMem_regWriteAddr (_mem_stage_io_fwdOut_regWriteAddr),
-    .io_fwdFromMem_result       (_mem_stage_io_fwdOut_result),
-    .io_fwdFromWb_valid         (_wb_stage_io_fwdOut_valid),
-    .io_fwdFromWb_regWriteEn    (_wb_stage_io_fwdOut_regWriteEn),
-    .io_fwdFromWb_regWriteAddr  (_wb_stage_io_fwdOut_regWriteAddr),
-    .io_fwdFromWb_result        (_wb_stage_io_fwdOut_result),
     .io_fwdOut_valid            (_ex_stage_io_fwdOut_valid),
     .io_fwdOut_regWriteEn       (_ex_stage_io_fwdOut_regWriteEn),
     .io_fwdOut_regWriteAddr     (_ex_stage_io_fwdOut_regWriteAddr),
+    .io_fwdOut_result           (_ex_stage_io_fwdOut_result),
     .io_fwdOut_resFromMem       (_ex_stage_io_fwdOut_resFromMem),
     .io_fwdOut_isCsr            (_ex_stage_io_fwdOut_isCsr),
     .io_branch_req              (_ex_stage_io_branch_req),
     .io_branch_pc               (_ex_stage_io_branch_pc),
+    .io_bp_update_valid         (_ex_stage_io_bp_update_valid),
+    .io_bp_update_pc            (_ex_stage_io_bp_update_pc),
+    .io_bp_update_isBranch      (_ex_stage_io_bp_update_isBranch),
+    .io_bp_update_taken         (_ex_stage_io_bp_update_taken),
+    .io_bp_update_target        (_ex_stage_io_bp_update_target),
     .io_flush                   (_ctrl_io_flush_ex),
     .io_timer_in                (_timer_io_timer_out),
     .io_data_sram_req           (_ex_stage_io_data_sram_req),
@@ -610,10 +626,6 @@ module core_top(
     .io_in_bits_inst_ertn      (_mem_stage_io_out_bits_inst_ertn),
     .io_in_bits_tlbOp          (_mem_stage_io_out_bits_tlbOp),
     .io_in_bits_is_refetch     (_mem_stage_io_out_bits_is_refetch),
-    .io_fwdOut_valid           (_wb_stage_io_fwdOut_valid),
-    .io_fwdOut_regWriteEn      (_wb_stage_io_fwdOut_regWriteEn),
-    .io_fwdOut_regWriteAddr    (_wb_stage_io_fwdOut_regWriteAddr),
-    .io_fwdOut_result          (_wb_stage_io_fwdOut_result),
     .io_rf_we                  (_wb_stage_io_rf_we),
     .io_rf_waddr               (_wb_stage_io_rf_waddr),
     .io_rf_wdata               (_wb_stage_io_rf_wdata),
@@ -724,6 +736,7 @@ module core_top(
   );
   tlb tlb_module (
     .clock            (aclk),
+    .reset            (~aresetn),
     .io_s0_vppn       (_if_stage_io_tlb_s0_vppn),
     .io_s0_va_bit12   (_if_stage_io_tlb_s0_va_bit12),
     .io_s0_asid       (_if_stage_io_tlb_s0_asid),
