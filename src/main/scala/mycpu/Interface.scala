@@ -47,9 +47,8 @@ class BranchPredictorUpdate extends Bundle {
 }
 
 
-// 五级流水线唯一的级间载荷。Top.scala 用 Decoupled 将 IF/ID/EX/MEM/WB 串联：
-// valid 表示本级持有一条有效指令，ready 由后级反压；每级内部的 valid_reg/data_reg
-// 就是流水寄存器。因此任一级（除法、访存、Cache miss 等）停顿都会自然冻结所有前级。
+// 双发射后端每个 lane 的体系结构载荷。DualLaneData 在其外层增加源寄存器
+// 元数据和串行化/等待标志，DualPacket 再组合两个按年龄排列的 lane。
 class PipelineData extends Bundle{
     //IF Generated
     val pc              = UInt(32.W)
@@ -104,6 +103,9 @@ class PipelineData extends Bundle{
     //Cache
     val is_cacop   = Bool()
     val cacop_op   = UInt(5.W)
+
+    val isLL       = Bool()
+    val isSC       = Bool()
 }
 
 

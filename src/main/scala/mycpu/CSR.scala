@@ -24,6 +24,7 @@ object CsrAddr {
     val TCFG        = "h41".U(14.W)
     val TVAL        = "h42".U(14.W)
     val TICLR       = "h44".U(14.W)
+    val LLBCTL      = "h60".U(14.W)
     val TLBRENTRY   = "h88".U(14.W)
     val DMW0        = "h180".U(14.W)
     val DMW1        = "h181".U(14.W)
@@ -172,6 +173,10 @@ class CSR extends Module {
         val tlb_out      = Output(new TlbEntry())
         val tlbidx_out   = Output(UInt(4.W))
         val tlbrentryOut = Output(UInt(32.W))
+
+        val llbitSet   = Input(Bool())
+        val llbitClear = Input(Bool())
+        val llbit      = Output(Bool())
     })
 
     def maskedWrite(reg: UInt, wdata: UInt, wmask: UInt): UInt = { (reg & ~wmask) | (wdata & wmask)}
@@ -220,6 +225,8 @@ class CSR extends Module {
     //TLB Refill Exception Entry Register
     //Virtual Address for TLB Refill Exception Handler
     val tlbrentry_va = RegInit(0.U(26.W))   //31:6
+    val llbit = RegInit(false.B)
+    val llbKlo = RegInit(false.B)
 
 
     ////////////////////////////////////////////////////////////////////////
@@ -266,6 +273,10 @@ class CSR extends Module {
             is(CsrAddr.TCFG)    { tcfg          := maskedWrite(tcfg.asUInt,     io.writeData, io.writeMask).asTypeOf(new TcfgReg()) }
 
             is(CsrAddr.TICLR)   { when((io.writeMask(0) & io.writeData(0)) === 1.U) { estat_is_timer := 0.U } }
+            is(CsrAddr.LLBCTL)  {
+                when(io.writeMask(2)) { llbKlo := io.writeData(2) }
+                when(io.writeMask(1) && io.writeData(1)) { llbit := false.B }
+            }
 
             is(CsrAddr.TLBRENTRY){tlbrentry_va  := maskedWrite(tlbrentry_va,    io.writeData(31, 6), io.writeMask(31, 6)) }
             
@@ -319,7 +330,16 @@ class CSR extends Module {
             crmd.da := 0.U
             crmd.pg := 1.U
         }
+        when(!llbKlo) { llbit := false.B }
+        llbKlo := false.B
     }
+
+    when(io.llbitSet) {
+        llbit := true.B
+    }.elsewhen(io.llbitClear) {
+        llbit := false.B
+    }
+    io.llbit := llbit
 
 
     ////////////////////////////////////////////////////////////////////////
@@ -346,6 +366,7 @@ class CSR extends Module {
         is(CsrAddr.TID)     { io.readData := tidReg }
         is(CsrAddr.TCFG)    { io.readData := tcfg.asUInt }
         is(CsrAddr.TVAL)    { io.readData := timer_cnt }
+        is(CsrAddr.LLBCTL)  { io.readData := Cat(0.U(29.W), llbKlo, 0.U(1.W), llbit) }
         is(CsrAddr.TLBRENTRY){io.readData := Cat(tlbrentry_va, 0.U(6.W)) }
         is(CsrAddr.DMW0)    { io.readData := dmw0.asUInt }
         is(CsrAddr.DMW1)    { io.readData := dmw1.asUInt }

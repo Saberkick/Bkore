@@ -141,10 +141,9 @@ class Cache extends Module {
     //Uncached
     val req_uncached = RegInit(false.B)
 
-    //LFSR Random Generator
-    val lfsr = RegInit("hACE1".U(16.W)) //just a seed
-    lfsr := Cat(lfsr(14, 0), lfsr(15) ^ lfsr(13) ^ lfsr(12) ^ lfsr(10))
-    val random_way = lfsr(0)
+    // The bit names the least-recently-used way.  It is consulted only when
+    // both ways are valid; an invalid way always wins replacement.
+    val lru_way = RegInit(VecInit(Seq.fill(256)(false.B)))
 
 
     //Read TagV
@@ -161,6 +160,7 @@ class Cache extends Module {
     val way1_tag = tagv_rdata_way1(20, 1)
     val way1_hit = (!req_uncached || req_cacop_en) && way1_v === 1.U && (way1_tag === req_tag)
     val cache_hit = (way0_hit || way1_hit) && (!req_uncached || req_cacop_en)
+    val replacement_way = Mux(!way0_v, false.B, Mux(!way1_v, true.B, lru_way(req_index)))
 
     //Req Buffer Latch
     val is_lookup_write = (main_state === sLookup) && (req_op === true.B)
@@ -281,14 +281,16 @@ class Cache extends Module {
                     }
                 }
             } .elsewhen(cache_hit) {
+                when(way0_hit) { lru_way(req_index) := true.B }
+                .otherwise     { lru_way(req_index) := false.B }
                 when(io.cpu.valid && !hit_write_hazard) { main_state := sLookup }
                 .otherwise {main_state := sIdle}
             } .otherwise {
                 main_state := sMiss
-                miss_replace_way := random_way
+                miss_replace_way := replacement_way
                 val is_safe_to_read = !req_uncached && !req_cacop_en
-                miss_victim_v    := Mux(is_safe_to_read, Mux(random_way === 0.U, way0_v, way1_v), false.B)
-                miss_victim_tag  := Mux(is_safe_to_read, Mux(random_way === 0.U, way0_tag, way1_tag), 0.U(20.W))
+                miss_victim_v    := Mux(is_safe_to_read, Mux(replacement_way === 0.U, way0_v, way1_v), false.B)
+                miss_victim_tag  := Mux(is_safe_to_read, Mux(replacement_way === 0.U, way0_tag, way1_tag), 0.U(20.W))
             }
         }
         is(sMiss) {
@@ -445,6 +447,7 @@ class Cache extends Module {
         .otherwise           { dirty_way1(wb_index) := true.B }
     }
     when(tagv_we) {
+        lru_way(req_index) := !miss_replace_way
         when(miss_replace_way === 0.U) { dirty_way0(req_index) := req_op }
         .otherwise                     { dirty_way1(req_index) := req_op }
     }

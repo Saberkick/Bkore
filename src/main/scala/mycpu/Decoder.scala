@@ -6,7 +6,7 @@ import chisel3.util._
 private object Src1 extends ChiselEnum{val X, R, PC = Value}
 private object Src2 extends ChiselEnum{val X, R, IMM = Value}
 private object Dst  extends ChiselEnum{val X, RD, RJ, R1 = Value}
-private object Imm  extends ChiselEnum{val X, SI12, UI12, SI16, SI20, SI26, UI5, FOUR = Value}
+private object Imm  extends ChiselEnum{val X, SI12, UI12, SI14, SI16, SI20, SI26, UI5, FOUR = Value}
 
 class DecodeOut extends Bundle{
     val aluOp           = UInt(12.W)
@@ -45,6 +45,9 @@ class DecodeOut extends Bundle{
 
     val is_cacop    = Bool()
     val cacop_op    = UInt(5.W)
+
+    val isLL        = Bool()
+    val isSC        = Bool()
 }
 
 class Decoder extends Module{
@@ -103,10 +106,12 @@ class Decoder extends Module{
         BitPat("b001010_0010_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.w
         BitPat("b001010_1000_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_BU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.bu
         BitPat("b001010_1001_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_HU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.hu
+        BitPat("b001000_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ll.w
 
         BitPat("b001010_0100_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_B,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.b
         BitPat("b001010_0101_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_H,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.h
         BitPat("b001010_0110_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.w
+        BitPat("b001001_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 1.U, BrType.NOP, 1.U, 1.U), // sc.w
 
         BitPat("b010011_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.NOP,   MduOp.NOP,   Src1.PC, Src2.R,    Imm.SI16,  Dst.RD,  1.U, 0.U, BrType.JIRL,1.U, 0.U), // jirl
         BitPat("b010100_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI26,  Dst.X,   0.U, 0.U, BrType.B,   0.U, 0.U),    // b
@@ -144,6 +149,7 @@ class Decoder extends Module{
     val rj = inst(9, 5)
     val rd = inst(4, 0)
     val i12 = inst(21, 10)
+    val i14 = inst(23, 10)
     val i16 = inst(25, 10)
     val i20 = inst(24, 5)
     val i26 = Cat(inst(9,0), inst(25, 10))
@@ -152,6 +158,7 @@ class Decoder extends Module{
         (imm_s === Imm.UI5.asUInt)  -> Cat(0.U(27.W), inst(14, 10)),
         (imm_s === Imm.SI12.asUInt) -> Cat(Fill(20, i12(11)), i12),
         (imm_s === Imm.UI12.asUInt) -> Cat(0.U(20.W), i12),
+        (imm_s === Imm.SI14.asUInt) -> Cat(Fill(16, i14(13)), i14, 0.U(2.W)),
         (imm_s === Imm.SI16.asUInt) -> Cat(Fill(14, i16(15)), i16, 0.U(2.W)),
         (imm_s === Imm.SI20.asUInt) -> Cat(i20, 0.U(12.W)),
         (imm_s === Imm.SI26.asUInt) -> Cat(Fill(4, i26(25)), i26, 0.U(2.W))
@@ -190,6 +197,7 @@ class Decoder extends Module{
     val is_tlbfill = inst === BitPat("b000001_1001_00_10000_01101_00000_00000") // 06483400
     // invtlb 的 [19:15] 是 10011
     val is_invtlb  = inst === BitPat("b000001_1001_00_10011_?????_?????_?????") && inst(4, 0) <= 6.U
+    val is_cacop   = inst === BitPat("b000001_1000_????_????_????_?????_?????")
 
     io.out.tlbOp := MuxCase(TlbOp.NOP, Seq(
         is_tlbsrch -> TlbOp.SRCH,
@@ -208,7 +216,8 @@ class Decoder extends Module{
         io.out.csrNum === "h180".U|| // DMW0
         io.out.csrNum === "h181".U   // DMW1
     )
-    io.out.is_refetch := is_csr_mmu_write || is_tlbrd || is_tlbwr || is_tlbfill || is_invtlb
+    io.out.is_refetch := is_csr_mmu_write || is_tlbrd || is_tlbwr ||
+        is_tlbfill || is_invtlb || is_cacop
 
     io.out.csrWe        := (is_csr && (rj =/= 0.U)) || is_tlbsrch
     io.out.isCsr        := is_csr || is_rdcntid
@@ -231,9 +240,10 @@ class Decoder extends Module{
 
     val is_tlb_inst     = is_tlbsrch || is_tlbrd || is_tlbwr || is_tlbfill || is_invtlb
 
-    val is_cacop = inst === BitPat("b000001_1000_????_????_????_?????_?????")
     io.out.is_cacop := is_cacop
     io.out.cacop_op := inst(4, 0)
+    io.out.isLL := inst(31, 26) === "b001000".U
+    io.out.isSC := inst(31, 26) === "b001001".U
 
     val inst_valid      =   (alu_s =/= AluOp.NOP) || (ls_s =/= LsOp.NOP) || (mdu_s =/= MduOp.NOP) || (br_t =/= BrType.NOP) || 
                             is_syscall || is_break || is_ertn || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop

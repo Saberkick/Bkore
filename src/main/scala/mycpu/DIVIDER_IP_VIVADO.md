@@ -57,3 +57,8 @@ Vivado 工程和任何手写 filelist 中都不能再包含旧的行为级 `div_
 ## 仿真注意事项
 
 Scala elaboration 只产生 `div_gen_0` 黑盒实例，不再提供行为模型。Vivado/xsim 仿真必须把 XCI 及其 simulation output products 加入仿真 fileset。若第三方仿真器只读取 `generated/filelist.f` 而未加载 Xilinx IP 仿真库，会报告找不到 `div_gen_0`，这是预期的集成错误，不能用旧的组合 `/`、`%` 文件回填。
+
+仓库的 `src/test/resources/div_gen_0_sim.sv` 是端口等价的仿真专用替身，
+仅供 Verilator 等软件仿真器使用。它不在 main source set 中，受控 RTL
+导出脚本也不会把它写入 manifest。该文件不得加入 Vivado synthesis
+fileset，硬件工程必须继续使用 XCI 及其 output products。

@@ -1,18 +1,22 @@
 package mycpu
 
 import circt.stage.ChiselStage
-import java.nio.file.{Files, Paths, StandardCopyOption}
 
+/** Default and competition-facing entry point: always emit the dual-issue core. */
 object Elaborate extends App {
+    val targetDir = args.sliding(2).collectFirst {
+        case Array("--target-dir", value) => value
+    }.getOrElse("generated/vivado-dual")
+
     ChiselStage.emitSystemVerilogFile(
-        new core_top(),
+        new DualCoreTop(),
         firtoolOpts = Array(
             "-disable-all-randomization",
             "-strip-debug-info"
         ),
         args = Array(
             "--target-dir",
-            "D:\\Develop\\CPU\\Archive\\mycpu\\generated"
+            targetDir
         )
     )
 }

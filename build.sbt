@@ -9,6 +9,7 @@ val chiselVersion = "7.7.0"
 lazy val root = (project in file("."))
   .settings(
     name := "%NAME%",
+    Compile / run / mainClass := Some("mycpu.Elaborate"),
     libraryDependencies ++= Seq(
       "org.chipsalliance" %% "chisel" % chiselVersion,
       "org.scalatest" %% "scalatest" % "3.2.19" % "test",
