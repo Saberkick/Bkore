@@ -1,4 +1,4 @@
-# MDU 除法 IP 配置说明（Vivado 2025.1 / 2026.1）
+# MDU 除法 IP 配置说明
 
 ## 已完成的 RTL 修改
 
@@ -46,36 +46,7 @@ Vivado 工程和任何手写 filelist 中都不能再包含旧的行为级 `div_
 
 默认 `Clocks per Division = 1` 会使用较多寄存器和 LUT，但最有利于 Fmax。顶层时序稳定后，如果面积压力更大，可以把它改成 2、4 或 8；本次 wrapper 已实现输入握手，不需要再改 Scala。每次改动都必须重新生成 output products 并重新看顶层时序，不能仅依据 IP 的 OOC 报告判断。
 
-## Tcl 一键配置（两个版本通用）
-
-先打开已经选好器件的 Vivado RTL 工程，再在 Tcl Console 执行：
-
-```tcl
-source D:/Develop/CPU/Archive/mycpu/src/main/scala/mycpu/create_div_gen_0.tcl
-```
-
-脚本会：
-
-1. 检查当前版本（目标为 2025.1 或 2026.1）。
-2. 从本机 IP Catalog 解析 `*:ip:div_gen:5.1`，兼容 `xilinx.com`/`amd.com` vendor 名称。
-3. 创建或重配名为 `div_gen_0` 的 IP。
-4. 生成所有 output products，并创建 `div_gen_0_synth_1` OOC run。
-
-然后运行 IP OOC 综合：
-
-```tcl
-launch_runs div_gen_0_synth_1
-wait_on_run div_gen_0_synth_1
-open_run div_gen_0_synth_1
-report_timing_summary
-report_utilization
-```
-
-最后重新综合 CPU 顶层，并确认最差路径已经不再包含普通 RTL 的 `$div`、`$mod`、`/` 或 `%` 运算单元。
-
 ## Vivado GUI 配置
-
-Vivado 2025.1 与 2026.1 的操作流程相同：
 
 1. 在 `Flow Navigator -> IP Catalog` 搜索 `Divider Generator`。
 2. 双击 `Divider Generator 5.1`，Component Name 填 `div_gen_0`。
@@ -83,9 +54,6 @@ Vivado 2025.1 与 2026.1 的操作流程相同：
 4. 点击 OK 后选择 `Generate Output Products`，建议使用默认 OOC synthesis。
 5. 在 `IP Sources` 中确认实例端口包含两个输入 `tready` 和 `aresetn`，输出宽度为 64 位。
 
-2026.1 如果打开由 2025.1 创建的 XCI 后显示 IP 状态变化，先执行 `report_ip_status`。只有报告要求升级时才对这个 IP 执行 `upgrade_ip [get_ips div_gen_0]`，随后重新生成 output products；不要直接复用旧版本产生的 DCP。更稳妥的做法是每个 Vivado 版本都从本仓库 Tcl 脚本重新创建 XCI/output products。
-
 ## 仿真注意事项
 
 Scala elaboration 只产生 `div_gen_0` 黑盒实例，不再提供行为模型。Vivado/xsim 仿真必须把 XCI 及其 simulation output products 加入仿真 fileset。若第三方仿真器只读取 `generated/filelist.f` 而未加载 Xilinx IP 仿真库，会报告找不到 `div_gen_0`，这是预期的集成错误，不能用旧的组合 `/`、`%` 文件回填。
-
