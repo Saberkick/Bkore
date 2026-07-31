@@ -98,8 +98,10 @@ class SramToAxiBridge extends Module {
     io.axi.arid    := ar_grant_id
     io.axi.araddr  := ar_addr_reg
     // 在 AR 状态机赋值处：
-    // 直接用锁存好的大小判断。4.U 代表 16 字节缓存行，需要 4 拍 (arlen=3)。否则单拍 (arlen=0)
-    io.axi.arlen  := Mux(ar_size_reg === 4.U, 3.U, 0.U)
+    // 6.U is a 64-byte line (16 x 32-bit beats); 4.U remains a
+    // 16-byte sector transaction and 2.U is an uncached single beat.
+    io.axi.arlen := Mux(ar_size_reg === 6.U, 15.U,
+        Mux(ar_size_reg === 4.U, 3.U, 0.U))
     io.axi.arsize := 2.U // 无论突发还是单拍，每一拍的数据量永远是 4 字节 (3b'010)
     io.axi.arburst := "b01".U  // INCR 模式
     io.axi.arlock  := 0.U      //

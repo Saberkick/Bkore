@@ -55,6 +55,13 @@ class PipelineData extends Bundle{
     val inst            = UInt(32.W)
     val predictedTaken  = Bool()
     val predictedTarget = UInt(32.W)
+    val predictedHit    = Bool()
+    val predictedWay    = Bool()
+    val predictedCall   = Bool()
+    val predictedReturn = Bool()
+    val historySpeculated = Bool()
+    val ghrSnapshot     = UInt(8.W)
+    val rasSpSnapshot   = UInt(4.W)
 
     //ID Generated
     //Used in EX

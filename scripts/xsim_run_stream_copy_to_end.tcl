@@ -1,0 +1,3 @@
+restart
+run all
+quit

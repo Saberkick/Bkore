@@ -24,16 +24,24 @@ class div_gen_0 extends ExtModule {
         val m_axis_dout_tdata       = Output(UInt(64.W))
     })
 }
-class Multiplier extends Module {
-    val io = IO(new Bundle {
-        val src1     = Input(UInt(32.W))
-        val src2     = Input(UInt(32.W))
-        val isSigned = Input(Bool())
-        val result64 = Output(UInt(64.W))
+
+/**
+  * Vivado Multiplier Generator black box.
+  *
+  * The synthesis definition is supplied by the Vivado project as an
+  * independently generated multiplier XCI.  RTL elaboration intentionally
+  * does not copy an XCI from this repository.  The IP is an unsigned 32x32 DSP
+  * multiplier with two pipeline stages, II=1, and no CE/reset/flush pins.
+  */
+class multiplier extends ExtModule {
+    override def desiredName: String = "multiplier"
+
+    val io = FlatIO(new Bundle {
+        val CLK = Input(Clock())
+        val A = Input(UInt(32.W))
+        val B = Input(UInt(32.W))
+        val P = Output(UInt(64.W))
     })
-    val signedRes   = RegNext(io.src1.asSInt * io.src2.asSInt).asUInt
-    val unsignedRes = RegNext(io.src1 * io.src2)
-    io.result64    := Mux(io.isSigned, signedRes, unsignedRes)
 }
 
 class Divider extends Module {
@@ -114,17 +122,25 @@ class Divider extends Module {
     val resultQ = Mux(divideByZeroPending, "hffffffff".U, div_ip.io.m_axis_dout_tdata(63, 32))
     val resultR = Mux(divideByZeroPending, dividendReg,     div_ip.io.m_axis_dout_tdata(31, 0))
     val resultFire = active && resultValid && !ipInReset
+    val resultDone = RegInit(false.B)
 
     // 输出没有 tready，必须在结果脉冲到达时锁存，才能承受 EX/MEM 的反压。
+    // done 和数据都从本地寄存器输出。除法完成因此多一拍，但 WB flush /
+    // IP reset 不会再穿过结果选择逻辑回到 RRD/EX payload 的数据输入。
     val qReg = Reg(UInt(32.W))
     val rReg = Reg(UInt(32.W))
+    when(ipInReset) {
+        resultDone := false.B
+    } .otherwise {
+        resultDone := resultFire
+    }
     when(resultFire) {
         qReg   := resultQ
         rReg   := resultR
         active := false.B
     }
 
-    io.done := resultFire
-    io.q    := Mux(resultFire, resultQ, qReg)
-    io.r    := Mux(resultFire, resultR, rReg)
+    io.done := resultDone
+    io.q    := qReg
+    io.r    := rReg
 }

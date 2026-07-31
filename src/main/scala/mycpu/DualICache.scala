@@ -4,23 +4,22 @@ import chisel3._
 import chisel3.util._
 
 class DualICacheCpuIO extends Bundle {
-    val valid    = Input(Bool())
-    val index    = Input(UInt(8.W))
-    val tag      = Input(UInt(20.W))
-    val offset   = Input(UInt(2.W))
+    val valid = Input(Bool())
+    val index = Input(UInt(8.W))
+    val tag = Input(UInt(20.W))
+    val offset = Input(UInt(2.W))
     val uncached = Input(Bool())
 
     val addrOk = Output(Bool())
     val dataOk = Output(Bool())
-    val line   = Output(UInt(128.W))
+    val line = Output(UInt(128.W))
 }
 
 /**
-  * Read-only 8 KiB, two-way, 16-byte-line instruction cache.
+  * Read-only 8 KiB, two-way ICache with 64-byte lines.
   *
-  * A hit returns the whole line so the frontend can select two adjacent
-  * instructions.  The external refill path remains the competition-standard
-  * 32-bit AXI burst interface.
+  * A line is four independent 128-bit sector RAMs.  The frontend sees only
+  * its requested sector while refill remains a 16-beat 32-bit AXI burst.
   */
 class DualICache extends Module {
     val io = IO(new Bundle {
@@ -32,67 +31,85 @@ class DualICache extends Module {
     val sIdle :: sLookup :: sMiss :: sRefill :: Nil = Enum(4)
     val state = RegInit(sIdle)
 
-    val tag0 = SyncReadMem(256, UInt(20.W))
-    val tag1 = SyncReadMem(256, UInt(20.W))
-    val data0 = SyncReadMem(256, UInt(128.W))
-    val data1 = SyncReadMem(256, UInt(128.W))
-    val valid0 = RegInit(VecInit(Seq.fill(256)(false.B)))
-    val valid1 = RegInit(VecInit(Seq.fill(256)(false.B)))
-    val lru = RegInit(VecInit(Seq.fill(256)(false.B)))
+    val tags = Seq.fill(2)(SyncReadMem(64, UInt(20.W)))
+    val sectors = Seq.fill(2, 4)(SyncReadMem(64, UInt(128.W)))
+    val valid = RegInit(VecInit(Seq.fill(2)(
+        VecInit(Seq.fill(64)(false.B))
+    )))
+    val lru = RegInit(VecInit(Seq.fill(64)(false.B)))
 
-    val reqIndex = RegInit(0.U(8.W))
-    val reqTag = RegInit(0.U(20.W))
-    val reqOffset = RegInit(0.U(2.W))
-    val reqUncached = RegInit(false.B)
-    val victimWay = RegInit(false.B)
-    val refillCount = RegInit(0.U(2.W))
+    val reqSet = Reg(UInt(6.W))
+    val reqSector = Reg(UInt(2.W))
+    val reqTag = Reg(UInt(20.W))
+    val reqOffset = Reg(UInt(2.W))
+    val reqUncached = Reg(Bool())
+
+    val accept = Wire(Bool())
+    val tagsRead = Wire(Vec(2, UInt(20.W)))
+    val sectorRead = Wire(Vec(2, Vec(4, UInt(128.W))))
+    for (way <- 0 until 2) {
+        tagsRead(way) := tags(way).read(
+            io.cpu.index(7, 2), accept)
+        for (sector <- 0 until 4) {
+            sectorRead(way)(sector) := sectors(way)(sector).read(
+                io.cpu.index(7, 2),
+                accept && io.cpu.index(1, 0) === sector.U)
+        }
+    }
+
+    val way0Hit = valid(0)(reqSet) && !reqUncached &&
+        tagsRead(0) === reqTag
+    val way1Hit = valid(1)(reqSet) && !reqUncached &&
+        tagsRead(1) === reqTag
+    val hit = way0Hit || way1Hit
+    val hitWay = way1Hit
+    val hitSector = Mux(hitWay,
+        sectorRead(1)(reqSector), sectorRead(0)(reqSector))
+
+    io.cpu.addrOk := state === sIdle || (state === sLookup && hit)
+    accept := io.cpu.valid && io.cpu.addrOk
+    when(accept) {
+        reqSet := io.cpu.index(7, 2)
+        reqSector := io.cpu.index(1, 0)
+        reqTag := io.cpu.tag
+        reqOffset := io.cpu.offset
+        reqUncached := io.cpu.uncached
+    }
+
+    val victimWay = Reg(Bool())
+    val refillCount = RegInit(0.U(4.W))
     val refillWords = Reg(Vec(4, UInt(32.W)))
     val suppressRefill = RegInit(false.B)
 
-    val canAccept = state === sIdle || (state === sLookup && !reqUncached)
-    val readEnable = io.cpu.valid && canAccept
-    val tagRead0 = tag0.read(io.cpu.index, readEnable)
-    val tagRead1 = tag1.read(io.cpu.index, readEnable)
-    val dataRead0 = data0.read(io.cpu.index, readEnable)
-    val dataRead1 = data1.read(io.cpu.index, readEnable)
-
-    val way0Hit = valid0(reqIndex) && tagRead0 === reqTag && !reqUncached
-    val way1Hit = valid1(reqIndex) && tagRead1 === reqTag && !reqUncached
-    val hit = way0Hit || way1Hit
-    val hitLine = Mux(way1Hit, dataRead1, dataRead0)
-
-    // Lookup can accept the next request only when the current request hits.
-    io.cpu.addrOk := state === sIdle || (state === sLookup && hit)
-    val accept = io.cpu.valid && io.cpu.addrOk
-
-    val assembledLine = Cat(
-        Mux(refillCount === 3.U, io.axi.ret_data, refillWords(3)),
-        Mux(refillCount === 2.U, io.axi.ret_data, refillWords(2)),
-        Mux(refillCount === 1.U, io.axi.ret_data, refillWords(1)),
-        Mux(refillCount === 0.U, io.axi.ret_data, refillWords(0))
+    val assembledSector = Cat(
+        Mux(refillCount(1, 0) === 3.U,
+            io.axi.ret_data, refillWords(3)),
+        Mux(refillCount(1, 0) === 2.U,
+            io.axi.ret_data, refillWords(2)),
+        Mux(refillCount(1, 0) === 1.U,
+            io.axi.ret_data, refillWords(1)),
+        Mux(refillCount(1, 0) === 0.U,
+            io.axi.ret_data, refillWords(0))
     )
-    val refillDone = state === sRefill && io.axi.ret_valid &&
-        (io.axi.ret_last || reqUncached)
+    val requestedSectorDone = state === sRefill &&
+        io.axi.ret_valid && (
+            reqUncached ||
+            (refillCount(3, 2) === reqSector &&
+             refillCount(1, 0) === 3.U))
 
-    io.cpu.dataOk := (state === sLookup && hit) || refillDone
-    io.cpu.line := Mux(reqUncached, Fill(4, io.axi.ret_data),
-        Mux(refillDone, assembledLine, hitLine))
+    io.cpu.dataOk := (state === sLookup && hit) ||
+        requestedSectorDone
+    io.cpu.line := Mux(reqUncached,
+        Fill(4, io.axi.ret_data),
+        Mux(requestedSectorDone, assembledSector, hitSector))
 
     when(io.invalidateAll) {
-        for (idx <- 0 until 256) {
-            valid0(idx) := false.B
-            valid1(idx) := false.B
+        for (way <- 0 until 2; set <- 0 until 64) {
+            valid(way)(set) := false.B
         }
         when(state === sMiss || state === sRefill) {
             suppressRefill := true.B
         }
-    }
-
-    when(accept) {
-        reqIndex := io.cpu.index
-        reqTag := io.cpu.tag
-        reqOffset := io.cpu.offset
-        reqUncached := io.cpu.uncached
     }
 
     switch(state) {
@@ -103,12 +120,11 @@ class DualICache extends Module {
         }
         is(sLookup) {
             when(reqUncached || !hit) {
-                val replacement = Mux(!valid0(reqIndex), false.B,
-                    Mux(!valid1(reqIndex), true.B, lru(reqIndex)))
-                victimWay := replacement
+                victimWay := Mux(!valid(0)(reqSet), false.B,
+                    Mux(!valid(1)(reqSet), true.B, lru(reqSet)))
                 state := sMiss
             }.otherwise {
-                lru(reqIndex) := way0Hit
+                lru(reqSet) := !hitWay
                 state := Mux(accept, sLookup, sIdle)
             }
         }
@@ -120,19 +136,28 @@ class DualICache extends Module {
         }
         is(sRefill) {
             when(io.axi.ret_valid) {
-                refillWords(refillCount) := io.axi.ret_data
-                when(io.axi.ret_last || reqUncached) {
-                    when(!reqUncached && !suppressRefill && !io.invalidateAll) {
-                        when(victimWay) {
-                            tag1.write(reqIndex, reqTag)
-                            data1.write(reqIndex, assembledLine)
-                            valid1(reqIndex) := true.B
-                        }.otherwise {
-                            tag0.write(reqIndex, reqTag)
-                            data0.write(reqIndex, assembledLine)
-                            valid0(reqIndex) := true.B
+                refillWords(refillCount(1, 0)) := io.axi.ret_data
+
+                when(!reqUncached && refillCount(1, 0) === 3.U) {
+                    for (way <- 0 until 2; sector <- 0 until 4) {
+                        when(victimWay === way.U &&
+                             refillCount(3, 2) === sector.U) {
+                            sectors(way)(sector).write(
+                                reqSet, assembledSector)
                         }
-                        lru(reqIndex) := !victimWay
+                    }
+                }
+
+                when(io.axi.ret_last || reqUncached) {
+                    when(!reqUncached && !suppressRefill &&
+                         !io.invalidateAll) {
+                        when(victimWay) {
+                            tags(1).write(reqSet, reqTag)
+                        }.otherwise {
+                            tags(0).write(reqSet, reqTag)
+                        }
+                        valid(victimWay)(reqSet) := true.B
+                        lru(reqSet) := !victimWay
                     }
                     suppressRefill := false.B
                     state := sIdle
@@ -144,9 +169,10 @@ class DualICache extends Module {
     }
 
     io.axi.rd_req := state === sMiss
-    io.axi.rd_type := Mux(reqUncached, 2.U, 4.U)
-    io.axi.rd_addr := Cat(reqTag, reqIndex,
-        Mux(reqUncached, Cat(reqOffset, 0.U(2.W)), 0.U(4.W)))
+    io.axi.rd_type := Mux(reqUncached, 2.U, 6.U)
+    io.axi.rd_addr := Mux(reqUncached,
+        Cat(reqTag, reqSet, reqSector, reqOffset, 0.U(2.W)),
+        Cat(reqTag, reqSet, 0.U(6.W)))
 
     io.axi.wr_req := false.B
     io.axi.wr_type := 0.U

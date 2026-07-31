@@ -44,3 +44,17 @@ class DualIssueUnit extends Module {
     io.issueCount := Mux(canDual, 2.U, Mux(io.in(0).valid, 1.U, 0.U))
     io.blockMask := Mux(io.in(0).valid && io.in(1).valid, blockMask, 0.U)
 }
+
+/** RRD availability downgrade without allowing lane 1 to overtake lane 0. */
+class DualIssueAvailability extends Module {
+    val io = IO(new Bundle {
+        val structuralCount = Input(UInt(2.W))
+        val lane1Selected = Input(Bool())
+        val blocked = Input(Vec(2, Bool()))
+        val selectedCount = Output(UInt(2.W))
+    })
+
+    io.selectedCount := Mux(io.blocked(0), 0.U,
+        Mux(io.lane1Selected && io.blocked(1), 1.U,
+            io.structuralCount))
+}

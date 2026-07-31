@@ -54,6 +54,8 @@ class tlb extends Module {
         //For INVTLB to delete some of the PTE
         val invtlb_valid = Input(Bool())
         val invtlb_op    = Input(UInt(5.W))
+        val invtlb_vppn  = Input(UInt(19.W))
+        val invtlb_asid  = Input(UInt(10.W))
         //0, 1: Invalidate all TLB entries (both global and non-global)
         //4:    Invalidate non-global TLB entries where ASID matches the input
         //5:    Invalidate non-global TLB entries where both ASID and VPN match
@@ -102,26 +104,14 @@ class tlb extends Module {
         (match_bits.orR, local_index, selected_entry)
     }
 
+    // NOP-Core's MMU selects payload fields directly with the CAM hit vector.
+    // Legal TLB state has at most one matching entry, so Mux1H removes two
+    // indexed 4:1 payload mux levels.  Priority encoding remains only on the
+    // architectural TLBSRCH index output.
     def hierarchicalSelect(matches: Vec[Bool]): (Bool, UInt, TlbEntry) = {
-        val groups = (0 until 4).map { group =>
-            val base = group * 4
-            selectGroup(base, (0 until 4).map(offset => matches(base + offset)))
-        }
-
-        val group_found = VecInit(groups.map(_._1))
-        val group_index = PriorityEncoder(group_found.asUInt)
-        val selected_local_index = MuxLookup(group_index, groups(0)._2)(Seq(
-            1.U(2.W) -> groups(1)._2,
-            2.U(2.W) -> groups(2)._2,
-            3.U(2.W) -> groups(3)._2
-        ))
-        val selected_entry = MuxLookup(group_index, groups(0)._3)(Seq(
-            1.U(2.W) -> groups(1)._3,
-            2.U(2.W) -> groups(2)._3,
-            3.U(2.W) -> groups(3)._3
-        ))
-
-        (group_found.asUInt.orR, Cat(group_index, selected_local_index), selected_entry)
+        val matchBits = matches.asUInt
+        val selectedEntry = Mux1H(matches, tlb_table)
+        (matchBits.orR, PriorityEncoder(matchBits), selectedEntry)
     }
 
     //Search Port 0
@@ -183,8 +173,11 @@ class tlb extends Module {
             val entry = tlb_table(i)
             val cond1 = !entry.g
             val cond2 = entry.g
-            val cond3 = (io.s1_asid === entry.asid)
-            val cond4 = (io.s1_vppn(18, 9) === entry.vppn(18, 9)) && (entry.ps4MB || (io.s1_vppn(8, 0) === entry.vppn(8, 0)))
+            val cond3 = io.invtlb_asid === entry.asid
+            val cond4 =
+                io.invtlb_vppn(18, 9) === entry.vppn(18, 9) &&
+                (entry.ps4MB ||
+                 io.invtlb_vppn(8, 0) === entry.vppn(8, 0))
 
             // 先用已复位的 valid 门控整条判定，未写入表项的 payload 不参与 INVTLB。
             val should_inv = tlb_valid(i) && MuxLookup(io.invtlb_op, false.B)(Seq(

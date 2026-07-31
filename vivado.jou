@@ -1,0 +1,24 @@
+#-----------------------------------------------------------
+# Vivado v2026.1 (64-bit)
+# SW Build 6511674 on Tue Jun 16 11:02:23 MDT 2026
+# IP Build 6504888 on Tue Jun 09 09:05:25 MDT 2026
+# SharedData Build 6501428 on Mon Jun 08 17:34:18 MDT 2026
+# Start of session at: Fri Jul 31 19:56:02 2026
+# Process ID         : 7084
+# Current directory  : D:/Develop/Archive/mycpu
+# Command line       : vivado.exe -mode batch -source D:\Develop\Archive\mycpu\scripts\report_routed_timing.tcl -tclargs D:\Develop\chiplab\fpga\nscscc-team\run_vivado\project\loongson.runs\impl_1\soc_top_routed.dcp D:\Develop\Archive\mycpu\generated\vivado-timing-100-native-ip-scoreboard-whatif 10.000
+# Log file           : D:/Develop/Archive/mycpu/vivado.log
+# Journal file       : D:/Develop/Archive/mycpu\vivado.jou
+# Running On         : Saberkick
+# Platform           : Windows 11
+# Operating System   : 26200
+# Processor Detail   : AMD Ryzen 7 5800X 8-Core Processor             
+# CPU Frequency      : 3800 MHz
+# CPU Physical cores : 8
+# CPU Logical cores  : 16
+# Host memory        : 68641 MB
+# Swap memory        : 4294 MB
+# Total Virtual      : 72936 MB
+# Available Virtual  : 49220 MB
+#-----------------------------------------------------------
+source {D:\Develop\Archive\mycpu\scripts\report_routed_timing.tcl}

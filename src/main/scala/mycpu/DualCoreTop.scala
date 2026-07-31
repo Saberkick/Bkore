@@ -125,6 +125,8 @@ class DualCoreTop extends RawModule {
         backend.io.tlbRData := tlbModule.io.r_dat
         tlbModule.io.invtlb_valid := backend.io.invtlbValid
         tlbModule.io.invtlb_op := backend.io.invtlbOp
+        tlbModule.io.invtlb_vppn := backend.io.invtlbVppn
+        tlbModule.io.invtlb_asid := backend.io.invtlbAsid
 
         backend.io.timer := timer.io.timer_out
         backend.io.hwInterrupt := intrpt
