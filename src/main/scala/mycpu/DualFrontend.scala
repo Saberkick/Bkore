@@ -4,9 +4,13 @@ import chisel3._
 import chisel3.util._
 
 /**
-  * Three logical fetch stages around a blocking line cache:
-  * F1 selects PC and predicts, F2 translates/requests, F3 aligns the returned
-  * line and feeds an eight-entry two-wide instruction queue.
+  * Three logical fetch stages around a blocking line cache.
+  *
+  * F1 launches the synchronous BHT/BTB lookup.  In F2 the returned prediction
+  * is combined with translation and accepted by the ICache.  F3 aligns the
+  * returned line and feeds the eight-entry instruction queue.  F1 may launch
+  * the next lookup in the same cycle that F2 is accepted, preserving one
+  * request per cycle on back-to-back ICache hits.
   */
 class DualFrontend extends Module {
     val io = IO(new Bundle {
@@ -14,6 +18,7 @@ class DualFrontend extends Module {
         val flushTarget = Input(UInt(32.W))
         val flushPredictorHistory = Input(Bool())
         val predictorUpdate = Input(new DualPredictorUpdate())
+        val rasCommit = Input(new DualRasCommit())
 
         val popCount = Input(UInt(2.W))
         val outValid = Output(Vec(2, Bool()))
@@ -37,58 +42,62 @@ class DualFrontend extends Module {
     val predictor = Module(new DualBranchPredictor())
     val queue = Module(new DualInstructionQueue())
 
-    val pc = RegInit(Config.START_PC)
-    predictor.io.reqPc(0) := pc
-    predictor.io.reqPc(1) := pc + 4.U
-    predictor.io.update := io.predictorUpdate
-    predictor.io.flushHistory := io.flushPredictorHistory
+    val fetchPc = RegInit(Config.START_PC)
+    val f2Valid = RegInit(false.B)
+    val f2Pc = RegInit(Config.START_PC)
 
-    io.tlbVppn := pc(31, 13)
-    io.tlbVaBit12 := pc(12)
+    predictor.io.update := io.predictorUpdate
+    predictor.io.rasCommit := io.rasCommit
+    predictor.io.flush := io.flush || io.flushPredictorHistory
+
+    io.tlbVppn := f2Pc(31, 13)
+    io.tlbVaBit12 := f2Pc(12)
     io.tlbAsid := io.mmuConfig.asid.asid
 
     val direct = io.mmuConfig.crmd.da === 1.U && io.mmuConfig.crmd.pg === 0.U
     val dmw0Hit = io.mmuConfig.crmd.pg === 1.U && !io.mmuConfig.crmd.da.asBool &&
-        pc(31, 29) === io.mmuConfig.dmw0.vseg &&
+        f2Pc(31, 29) === io.mmuConfig.dmw0.vseg &&
         ((io.mmuConfig.crmd.plv === 0.U && io.mmuConfig.dmw0.plv0.asBool) ||
          (io.mmuConfig.crmd.plv === 3.U && io.mmuConfig.dmw0.plv3.asBool))
     val dmw1Hit = io.mmuConfig.crmd.pg === 1.U && !io.mmuConfig.crmd.da.asBool &&
-        pc(31, 29) === io.mmuConfig.dmw1.vseg &&
+        f2Pc(31, 29) === io.mmuConfig.dmw1.vseg &&
         ((io.mmuConfig.crmd.plv === 0.U && io.mmuConfig.dmw1.plv0.asBool) ||
          (io.mmuConfig.crmd.plv === 3.U && io.mmuConfig.dmw1.plv3.asBool))
     val dmwHit = dmw0Hit || dmw1Hit
-    val dmwPa = Mux(dmw0Hit, Cat(io.mmuConfig.dmw0.pseg, pc(28, 0)),
-        Cat(io.mmuConfig.dmw1.pseg, pc(28, 0)))
-    val tlbPa = Mux(io.tlbPs === 12.U, Cat(io.tlbPpn, pc(11, 0)),
-        Cat(io.tlbPpn(19, 9), pc(20, 0)))
-    val pa = Mux(direct, pc, Mux(dmwHit, dmwPa,
-        Mux(io.tlbFound && io.tlbV, tlbPa, pc)))
+    val dmwPa = Mux(dmw0Hit, Cat(io.mmuConfig.dmw0.pseg, f2Pc(28, 0)),
+        Cat(io.mmuConfig.dmw1.pseg, f2Pc(28, 0)))
+    val tlbPa = Mux(io.tlbPs === 12.U, Cat(io.tlbPpn, f2Pc(11, 0)),
+        Cat(io.tlbPpn(19, 9), f2Pc(20, 0)))
+    val pa = Mux(direct, f2Pc, Mux(dmwHit, dmwPa,
+        Mux(io.tlbFound && io.tlbV, tlbPa, f2Pc)))
 
     val dmwMat = Mux(dmw0Hit, io.mmuConfig.dmw0.mat, io.mmuConfig.dmw1.mat)
     val currentMat = Mux(direct, io.mmuConfig.crmd.datf,
         Mux(dmwHit, dmwMat, io.tlbMat))
     val uncached = currentMat === 0.U
 
-    val mapped = io.mmuConfig.crmd.pg === 1.U && !io.mmuConfig.crmd.da.asBool && !dmwHit
+    val mapped = io.mmuConfig.crmd.pg === 1.U &&
+        !io.mmuConfig.crmd.da.asBool && !dmwHit
     val excRefill = mapped && !io.tlbFound
     val excPif = mapped && io.tlbFound && !io.tlbV
     val excPpi = mapped && io.tlbFound && io.tlbV &&
         io.mmuConfig.crmd.plv > io.tlbPlv
-    val excAlign = pc(1, 0) =/= 0.U
+    val excAlign = f2Pc(1, 0) =/= 0.U
     val fetchException = excAlign || excRefill || excPif || excPpi
     val fetchEcode = Mux(excAlign, ExcCode.ADEF,
         Mux(excRefill, ExcCode.TLBR,
         Mux(excPif, ExcCode.PIF,
         Mux(excPpi, ExcCode.PPI, 0.U))))
 
-    val slot0Taken = predictor.io.result(0).taken && !fetchException
-    val lineHasSecond = pc(3, 2) =/= 3.U
-    val allowSecond = lineHasSecond && !uncached && !slot0Taken && !fetchException
+    val slot0Taken = f2Valid && predictor.io.result(0).taken && !fetchException
+    val lineHasSecond = f2Pc(3, 2) =/= 3.U
+    val allowSecond = f2Valid && lineHasSecond && !uncached &&
+        !slot0Taken && !fetchException
     val slot1Taken = predictor.io.result(1).taken && allowSecond
     val requestCount = Mux(allowSecond, 2.U(2.W), 1.U(2.W))
     val predictedNext = Mux(slot0Taken, predictor.io.result(0).target,
         Mux(slot1Taken, predictor.io.result(1).target,
-            pc + Mux(allowSecond, 8.U, 4.U)))
+            f2Pc + Mux(allowSecond, 8.U, 4.U)))
 
     val waitResponse = RegInit(false.B)
     val discardResponse = RegInit(false.B)
@@ -97,8 +106,10 @@ class DualFrontend extends Module {
     val pendingCount = RegInit(0.U(2.W))
     val pendingException = RegInit(false.B)
     val pendingEcode = RegInit(0.U(6.W))
+    val pendingHit = RegInit(VecInit(Seq.fill(2)(false.B)))
     val pendingTaken = RegInit(VecInit(Seq.fill(2)(false.B)))
     val pendingTarget = RegInit(VecInit(Seq.fill(2)(0.U(32.W))))
+    val pendingHistory = RegInit(VecInit(Seq.fill(2)(0.U(6.W))))
 
     val buffer = Reg(Vec(2, new DualFetchEntry()))
     val bufferCount = RegInit(0.U(2.W))
@@ -124,8 +135,10 @@ class DualFrontend extends Module {
         responseEntries(slot).pc := pendingPc + (slot * 4).U
         responseEntries(slot).inst := Mux(pendingException, "h03400000".U,
             selectedWord)
+        responseEntries(slot).predictedHit := pendingHit(slot)
         responseEntries(slot).predictedTaken := pendingTaken(slot)
         responseEntries(slot).predictedTarget := pendingTarget(slot)
+        responseEntries(slot).predictedHistory := pendingHistory(slot)
         responseEntries(slot).hasException := pendingException
         responseEntries(slot).ecode := pendingEcode
     }
@@ -153,10 +166,8 @@ class DualFrontend extends Module {
 
     val requestSlotFree = !waitResponse || (realResponse && sourceDrained)
     val outputSlotFree = bufferCount === 0.U || sourceDrained
-    val mayRequest = requestSlotFree && outputSlotFree && !discardResponse && !io.flush
-    // Translation/alignment faults are architectural fetch results, not
-    // memory transactions.  Synthesize their queue entries locally so an
-    // exception cannot deadlock behind an unrelated ICache miss.
+    val mayRequest = f2Valid && requestSlotFree && outputSlotFree &&
+        !discardResponse && !io.flush
     val syntheticRequest = mayRequest && fetchException
     io.cache.valid := mayRequest && !fetchException
     val safePa = Mux(fetchException, Config.START_PC, pa)
@@ -166,8 +177,24 @@ class DualFrontend extends Module {
     io.cache.uncached := uncached
     val requestFire = (io.cache.valid && io.cache.addrOk) || syntheticRequest
 
+    // F1 can replace F2 in the same cycle that F2 enters the ICache.  When F2
+    // stalls, reqValid is low and the synchronous table outputs remain stable.
+    // Keep the synchronous predictor address independent of requestFire.
+    // requestFire contains the complete backend/queue/cache ready chain; using
+    // it in this mux recreated the old backend-to-frontend critical path all
+    // the way into the BRAM address pins.  While F2 is stalled reqValid is low,
+    // so driving predictedNext is harmless and the memory output still holds.
+    val launchPc = Mux(f2Valid, predictedNext, fetchPc)
+    val launchPredictor = (!f2Valid || requestFire) && !io.flush
+    predictor.io.reqValid := launchPredictor
+    predictor.io.reqPc(0) := launchPc
+    predictor.io.reqPc(1) := launchPc + 4.U
+    predictor.io.consume := requestFire && (slot0Taken || slot1Taken)
+    predictor.io.consumeSlot := slot1Taken
+
     when(io.flush) {
-        pc := io.flushTarget
+        fetchPc := io.flushTarget
+        f2Valid := false.B
         waitResponse := false.B
         pendingSynthetic := false.B
         bufferCount := 0.U
@@ -175,18 +202,28 @@ class DualFrontend extends Module {
             discardResponse := true.B
         }
     }.otherwise {
+        when(launchPredictor) {
+            f2Pc := launchPc
+            f2Valid := true.B
+        }.elsewhen(requestFire) {
+            f2Valid := false.B
+        }
+
         when(requestFire) {
-            pc := predictedNext
+            fetchPc := predictedNext
             waitResponse := true.B
             pendingSynthetic := syntheticRequest
-            pendingPc := pc
+            pendingPc := f2Pc
             pendingCount := requestCount
             pendingException := fetchException
             pendingEcode := fetchEcode
-            pendingTaken(0) := slot0Taken
-            pendingTaken(1) := slot1Taken
-            pendingTarget(0) := predictor.io.result(0).target
-            pendingTarget(1) := predictor.io.result(1).target
+            for (slot <- 0 until 2) {
+                pendingHit(slot) := predictor.io.result(slot).hit
+                pendingTaken(slot) := predictor.io.result(slot).taken &&
+                    (if (slot == 0) true.B else allowSecond)
+                pendingTarget(slot) := predictor.io.result(slot).target
+                pendingHistory(slot) := predictor.io.result(slot).history
+            }
         }.elsewhen(realResponse) {
             waitResponse := false.B
             pendingSynthetic := false.B
@@ -209,4 +246,5 @@ class DualFrontend extends Module {
     when(discardResponse && io.cache.dataOk) {
         discardResponse := false.B
     }
+
 }

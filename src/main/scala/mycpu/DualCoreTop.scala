@@ -76,7 +76,7 @@ class DualCoreTop extends RawModule {
         val frontend = Module(new DualFrontend())
         val backend = Module(new DualBackend())
         val icache = Module(new DualICache())
-        val dcache = Module(new Cache())
+        val dcache = Module(new DualBankDCache())
         val bridge = Module(new SramToAxiBridge())
         val tlbModule = Module(new tlb())
         val timer = Module(new StableCounter())
@@ -88,6 +88,7 @@ class DualCoreTop extends RawModule {
         frontend.io.flushTarget := backend.io.frontendTarget
         frontend.io.flushPredictorHistory := backend.io.flushPredictorHistory
         frontend.io.predictorUpdate := backend.io.predictorUpdate
+        frontend.io.rasCommit := backend.io.rasCommit
 
         frontend.io.cache <> icache.io.cpu
         icache.io.invalidateAll := backend.io.icacheInvalidateAll
@@ -106,17 +107,29 @@ class DualCoreTop extends RawModule {
         frontend.io.tlbMat := tlbModule.io.s0_mat
         frontend.io.tlbV := tlbModule.io.s0_v
 
-        tlbModule.io.s1_vppn := backend.io.tlbVppn
-        tlbModule.io.s1_va_bit12 := backend.io.tlbVaBit12
-        tlbModule.io.s1_asid := backend.io.tlbAsid
-        backend.io.tlbFound := tlbModule.io.s1_found
-        backend.io.tlbIndex := tlbModule.io.s1_index
-        backend.io.tlbPpn := tlbModule.io.s1_ppn
-        backend.io.tlbPs := tlbModule.io.s1_ps
-        backend.io.tlbPlv := tlbModule.io.s1_plv
-        backend.io.tlbMat := tlbModule.io.s1_mat
-        backend.io.tlbD := tlbModule.io.s1_d
-        backend.io.tlbV := tlbModule.io.s1_v
+        tlbModule.io.s1_vppn := backend.io.tlbVppn(0)
+        tlbModule.io.s1_va_bit12 := backend.io.tlbVaBit12(0)
+        tlbModule.io.s1_asid := backend.io.tlbAsid(0)
+        backend.io.tlbFound(0) := tlbModule.io.s1_found
+        backend.io.tlbIndex(0) := tlbModule.io.s1_index
+        backend.io.tlbPpn(0) := tlbModule.io.s1_ppn
+        backend.io.tlbPs(0) := tlbModule.io.s1_ps
+        backend.io.tlbPlv(0) := tlbModule.io.s1_plv
+        backend.io.tlbMat(0) := tlbModule.io.s1_mat
+        backend.io.tlbD(0) := tlbModule.io.s1_d
+        backend.io.tlbV(0) := tlbModule.io.s1_v
+
+        tlbModule.io.s2_vppn := backend.io.tlbVppn(1)
+        tlbModule.io.s2_va_bit12 := backend.io.tlbVaBit12(1)
+        tlbModule.io.s2_asid := backend.io.tlbAsid(1)
+        backend.io.tlbFound(1) := tlbModule.io.s2_found
+        backend.io.tlbIndex(1) := tlbModule.io.s2_index
+        backend.io.tlbPpn(1) := tlbModule.io.s2_ppn
+        backend.io.tlbPs(1) := tlbModule.io.s2_ps
+        backend.io.tlbPlv(1) := tlbModule.io.s2_plv
+        backend.io.tlbMat(1) := tlbModule.io.s2_mat
+        backend.io.tlbD(1) := tlbModule.io.s2_d
+        backend.io.tlbV(1) := tlbModule.io.s2_v
 
         tlbModule.io.we := backend.io.tlbWe
         tlbModule.io.w_index := backend.io.tlbWIndex

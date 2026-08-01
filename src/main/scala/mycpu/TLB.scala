@@ -50,6 +50,20 @@ class tlb extends Module {
         val s1_mat      = Output(UInt(2.W))
         val s1_d        = Output(Bool())
         val s1_v        = Output(Bool())
+
+        // Second LSU search port.  Management operations continue to use s1;
+        // ordinary lane-1 memory accesses use s2.
+        val s2_vppn     = Input(UInt(19.W))
+        val s2_va_bit12 = Input(Bool())
+        val s2_asid     = Input(UInt(10.W))
+        val s2_found    = Output(Bool())
+        val s2_index    = Output(UInt(4.W))
+        val s2_ppn      = Output(UInt(20.W))
+        val s2_ps       = Output(UInt(6.W))
+        val s2_plv      = Output(UInt(2.W))
+        val s2_mat      = Output(UInt(2.W))
+        val s2_d        = Output(Bool())
+        val s2_v        = Output(Bool())
     
         //For INVTLB to delete some of the PTE
         val invtlb_valid = Input(Bool())
@@ -176,6 +190,32 @@ class tlb extends Module {
     io.s1_d   := Mux(found1, selected_lo1.d, false.B)
     io.s1_v   := Mux(found1, selected_lo1.v, false.B)
     io.s1_ps  := Mux(found1, Mux(hit1.ps4MB, 21.U(6.W), 12.U(6.W)), 0.U)
+
+    // Search Port 2 (second LSU lane)
+    val match2 = Wire(Vec(16, Bool()))
+    for (i <- 0 until 16) {
+        val entry = tlb_table(i)
+        val vppn_match = (io.s2_vppn(18, 9) === entry.vppn(18, 9)) &&
+            (entry.ps4MB || (io.s2_vppn(8, 0) === entry.vppn(8, 0)))
+        match2(i) := tlb_valid(i) && vppn_match &&
+            (entry.asid === io.s2_asid || entry.g)
+    }
+
+    val search2 = hierarchicalSelect(match2)
+    val found2 = search2._1
+    val index2 = search2._2
+    val hit2 = search2._3
+    val sel2 = Mux(hit2.ps4MB, io.s2_vppn(8), io.s2_va_bit12)
+    val selected_lo2 = Mux(sel2, hit2.lo1, hit2.lo0)
+
+    io.s2_found := found2
+    io.s2_index := index2
+    io.s2_ppn := Mux(found2, selected_lo2.ppn, 0.U)
+    io.s2_plv := Mux(found2, selected_lo2.plv, 0.U)
+    io.s2_mat := Mux(found2, selected_lo2.mat, 0.U)
+    io.s2_d   := Mux(found2, selected_lo2.d, false.B)
+    io.s2_v   := Mux(found2, selected_lo2.v, false.B)
+    io.s2_ps  := Mux(found2, Mux(hit2.ps4MB, 21.U(6.W), 12.U(6.W)), 0.U)
 
     // INVTLB
     when(io.invtlb_valid) {

@@ -1,258 +1,103 @@
-# LoongArch CPU 设计说明
+# mycpu 顺序双发射设计说明
 
-本文档是 `mycpu` 双发射实现的体系结构与验证基准。唯一的默认导出顶层为
-`DualCoreTop`，生成的 SystemVerilog 模块名为比赛要求的 `core_top`。
+本文对应 `f1cb0f8` 基线上的性能优化版。设计保持 LoongArch32、顺序提交、现有
+`core_top` AXI/调试接口，不包含乱序执行、ROB、寄存器重命名或新的 XCI。
 
-本核保持 LoongArch32、32 位 AXI、16 项 TLB、8 KiB I/D Cache
-以及现有 CSR/异常模型，借鉴 LLCL-MIPS 的前端分级、指令队列和
-锁步双发射思想，但不包含 MIPS CP0、延迟槽或 MIPS 指令语义。
-
-## 1. Dual 总体结构
+## 1. 流水线
 
 ```text
-F1 → F2 → F3 → ID/Issue → EX → M1 → M2 → WB
+F1(BPU read) -> F2(I-TLB/I-Cache request) -> F3(queue)
+             -> ID/Issue -> Issue Buffer -> EX -> M1 -> M2 -> WB
 ```
 
-- F1：维护 PC，同时查询两个取指槽的分支预测信息。
-- F2：完成 DMW/TLB 翻译，访问 16 B ICache line。
-- F3：从返回 Cache line 选择一至两条指令并写入指令队列。
-- ID/Issue：双译码、4R2W 寄存器堆、前递、相关与结构冲突检查。
-- EX：两个整数 ALU、共享乘除法器、分支解析和虚地址计算。
-- M1：DTLB、权限检查、物理地址形成和 DCache 请求。
-- M2：等待阻塞式 DCache 响应并完成 load 数据扩展。
-- WB：最多提交两条指令，更新 GPR/CSR/TLB/LLBit 并产生精确冲刷。
+- F1 向同步 BHT/BTB 发起查询；F2 获得预测结果并和 ICache 请求对齐。
+- ID 同时译码两个队首项，完成寄存器读取、前递、RAW/WAW 和结构冲突检查。
+- Issue Buffer 是两个 `DualPacket` 深的信用式缓冲。前端只依赖寄存的空闲容量，
+  不再承受 M1/TLB/DCache 到 `popCount` 的组合 ready 链。
+- Issue Buffer 中所有有效 lane 都是 scoreboard producer；结果尚未产生，因此依赖
+  它们的消费者必须等待 producer 到达 EX/M1/M2 的可前递位置。
+- EX/M1/M2/WB 都保持 lane0 年老、lane1 年轻的锁步双 lane；没有年轻指令越过
+  未完成 load 或 div。
 
-后端使用含两个 lane 的锁步 `DualPacket`。lane 0 永远比 lane 1 年老；
-两个 lane 一起经过 EX/M1/M2/WB，lane 1 不能越过 lane 0。设计没有
-乱序执行、寄存器重命名、推测提交或非阻塞 Cache。
+## 2. 两拍局部历史分支预测
 
-## 2. 双宽前端
+`DualBranchPredictor` 参考 NoAXI-LoongArch-CPU 的局部历史思路重新实现，没有复制
+其乱序、ARAT、ROB 或工程文件：
 
-### 2.1 DualICache
+- BHT 和 BTB 均为 1024 项，按 `PC[2]` 分成 `2 x 512` 同步读 Bank。
+- 每个 BTB 项保存 tag、target、条件分支、CALL 和 RETURN 标志。
+- 每项使用 6 位局部历史；每 Bank 有 64 个 2 位饱和 PHT 计数器，初值弱不跳。
+- 8 项推测 RAS 与 8 项提交态影子用于 CALL/RETURN 预测。
+- `BL`、`JIRL rd=1` 是 CALL；`JIRL r0,r1,0` 是 RETURN。
+- Fetch entry 携带 BTB hit、方向、目标和历史快照，EX 用快照训练原 PHT 项。
+- BTB/PHT 更新和 RAS 恢复各延迟一拍，避免重新形成后端到前端长路径。
 
-Dual ICache 为 8 KiB、2 路组相联、256 组、16 B Cache line：
+BHT/BTB payload 无复位并推断为 BRAM。BTB valid 使用 LUTRAM，在复位后用 512 拍
+逐项清零；清零期间预测器静态预测不跳且忽略训练。这避免 1024 个复位位展开成
+大量 FF/LUT，也不需要 `$readmemh` 初始化文件。
+
+lane0 已预测跳转时只取 slot0。lane0 预测不跳分支可以和 lane1 的安全普通 ALU
+配对；如果 lane0 实际跳转或预测错误，lane1 在进入 M1 前作废，不会提交或产生
+访存副作用。
+
+## 3. 发射、前递与 MDU
+
+允许的关键双发射组合：
+
+- 两条互不相关的普通 ALU；
+- lane0 MUL + lane1 无依赖普通 ALU；
+- lane0 预测不跳分支 + lane1 无依赖普通 ALU；
+- 两条确定为直接地址、cacheable 且有效地址 `bit[4]` 不同的普通访存。
+
+CSR、TLB、CACOP、LL/SC、ERTN、uncached 和其他序列化操作仍单发射。映射地址或
+DMW 地址的 MAT 要到 M1 才能确定，所以当前保守地不做双访存配对。同 Bank 访存
+保持 lane0 优先，lane1 留在前端队列下一拍重新作为 lane0 发射。
+
+scoreboard 顺序为 Issue Buffer、EX、M1、M2、WB，且每一级都覆盖两个 lane。
+普通 ALU 可前递；MUL 在 M1 边界寄存后从 M1 前递，避免 DSP 组合结果回到 ID。
+load 在 M2 `data_ok` 同拍即可前递，否则消费者阻塞。两个 load 一快一慢时，M2
+保存已完成 lane 的数据和 done，直到另一 lane 完成才整体推进。
+
+乘法使用一个统一的 33x33 RTL 表达式，Vivado 推断 DSP，结果在 M1 寄存，允许
+每拍启动一个 MUL。除法继续使用 `div_gen_0`、独占 EX 并阻塞流水；配置见
+[`src/main/scala/mycpu/DIVIDER_IP_VIVADO.md`](src/main/scala/mycpu/DIVIDER_IP_VIVADO.md)。
+不需要也不得加入 multiplier XCI。
+
+## 4. 双 LSU、TLB 和 16 KiB DCache
+
+TLB 有三个并行查询端口：一个 IF、两个 LSU，均沿用 16 项全相联比较和 4x4
+分层选择。M1 对两个 lane 分别做 DMW/TLB 翻译、权限检查和异常编码；lane0 异常
+会禁止 lane1 store/cache 请求等副作用。
+
+`DualBankDCache` 包含两个现有 `Cache` 实例：
 
 ```text
-Tag[31:12] | Index[11:4] | Offset[3:0]
+总容量 16 KiB
+Bank = PA[4]
+每 Bank：8 KiB、2-way、256 set、16 B line
+Set = PA[12:5], Tag = PA[31:13]
 ```
 
-命中时返回完整 128 位 Cache line，F3 最多选择当前 PC 和 `PC+4`
-两条指令。若 PC 位于 line 最后一个字、访问为 uncached、slot 0
-预测跳转或发生取指异常，则本次只产生一条指令。
+两个 Bank 的 hit 可并行。外部仍是原来的单路 AXI：read miss 用 owner 锁定到
+`ret_last`，write 请求轮转仲裁且一次接受一个。`core_top` AXI 端口完全不变。
 
-Cache miss 仍通过 32 位 AXI 执行四拍 refill；替换策略为无效路优先，
-两路均有效时使用每组一位 LRU。Tag/数据 payload 无复位，独立 valid
-位在复位时清零。uncached 请求携带 PC 的真实字偏移，不会错误地总是读取
-Cache line 的第一个字；取指翻译/对齐异常由前端本地生成，不依赖 ICache
-或 AXI 返回。
+## 5. 异常、flush 与精确提交
 
-### 2.2 指令队列
+- lane0 始终先于 lane1 提交；lane0 异常抑制 lane1 的提交和副作用。
+- WB exception/interrupt/ERTN/refetch 清空前端、Issue Buffer、EX/M1/M2。
+- EX 分支纠错清空前端和 Issue Buffer，并作废当前双发射包的 lane1。
+- 分支预测状态不属于架构状态；RAS 从提交态影子恢复，BTB/PHT 只影响性能。
 
-前端使用 8 项 `DualInstructionQueue`：
-
-- 每拍最多连续写入两项、连续弹出两项；
-- slot 1 不允许脱离 slot 0 单独入队；
-- 单发射时只弹出队首，原 slot 1 下一拍成为新的 lane 0；
-- 分支纠错、异常、ERTN 和 refetch 统一清空队列；
-- 未返回的旧 ICache 响应通过 discard 状态吞掉。
-
-### 2.3 分支预测
-
-`DualBranchPredictor` 包含：
-
-- 两个取指槽银行；
-- 总计 256 项直接映射 BTB，每个银行 128 项；
-- 总计 1024 个两位 gshare 方向计数器；
-- 8 位全局历史寄存器。
-
-相邻两个取指槽固定落在不同银行，每个银行只保留一个异步读口；BTB
-数据使用 `Mem` 描述，使 Vivado 可以映射为 LUTRAM，而不是把整张表展开
-成寄存器和大规模多路器。
-
-slot 0 预测跳转时 slot 1 不进入队列；slot 1 预测跳转时两条指令均保留。
-EX 只在对应指令实际前进时产生训练信息，预测器先将训练信息寄存一拍，
-再更新 BTB/PHT，以切断 backend 到 frontend 表写译码的长组合路径。方向
-或目标错误会冲刷所有年轻指令；曾预测为分支但实际为非分支的 BTB 项会
-失效。
-
-## 3. 译码与发射规则
-
-两个 `Decoder` 并行工作，`DualIssueUnit` 只决定同一队首对能否一起发射。
-以下组合允许双发射：
-
-- 两条互不相关的普通整数指令；
-- 一条普通整数指令加一条访存指令；
-- 一条普通整数指令加 lane 1 分支。
-
-以下条件强制只发射 lane 0：
-
-- lane 0 的目的寄存器被 lane 1 读取，即同包 RAW；
-- 两条指令写同一非零目的寄存器，即同包 WAW；
-- lane 0 是分支或 MDU；
-- lane 1 是 MDU；
-- 两条都是访存；
-- lane 1 分支与 lane 0 分支、访存或 MDU 配对；
-- 任一指令是异常或串行化指令。
-
-CSR、TLB、CACOP、ERTN、`ll.w` 和 `sc.w` 均为串行化指令：只有 EX、
-M1、M2、WB 中不存在年老指令时才能进入 EX；它进入后，在提交或触发
-refetch 之前也禁止任何年轻指令发射。
-
-## 4. 数据相关与执行
-
-寄存器堆为 32×32 位、4 读 2 写，`r0` 恒为零。两个写口按年龄排列，
-防御性 WAW 情况下 lane 1 优先；正常发射规则不会产生同包 WAW。
-
-ID 的源操作数按以下顺序查找最年轻生产者：
-
-```text
-EX lane1/0 → M1 lane1/0 → M2 lane1/0 → WB lane1/0 → RegFile
-```
-
-普通 ALU、已完成 MDU 和已完成 load 可以前递。load 或 CSR 结果尚未产生
-时，消费者保持在指令队列。两个整数 ALU 独立，共享一个 MDU 和一个 LSU。
-
-乘法结果在 EX 内寄存一拍。除法 wrapper 一次只接收一个请求，并根据
-Divider Generator 的 AXI-Stream valid/ready 和输出 valid 工作，不依赖
-固定 IP 延迟。除数为零时返回商 `0xffffffff`、余数为原被除数。
-
-## 5. 地址翻译和存储系统
-
-地址翻译优先级为：
-
-1. `CRMD.DA=1 && CRMD.PG=0`：直接地址；
-2. 分页模式下命中 DMW0/DMW1；
-3. 查询 16 项全相联 TLB。
-
-M1 检查 TLBR、PIL、PIS、PPI 和 PME，MAT=0 的访问标记为 uncached。
-load/store 对齐错误在 EX 产生 ALE。每个 `DualPacket` 最多含一条 LSU
-操作，因此 DTLB 端口 1 和 DCache 都保持单端口。
-
-DCache 继续使用 8 KiB、2 路、16 B line、write-back/write-allocate
-阻塞式实现。替换路先选择 invalid，再按每组 LRU 选择。外部仍只有一个
-32 位 AXI 主接口，I/D Cache 通过 `SramToAxiBridge` 仲裁；首版不允许
-乱序 AXI 或多个全局读 burst 在途。
-
-I/D Cache CACOP、TLB 修改和 MMU CSR 修改均串行执行并在 WB refetch。
-
-## 6. 精确提交与冲刷
-
-提交和重定向优先级固定为：
-
-```text
-reset > exception/interrupt/ERTN > refetch > branch correction
-```
-
-- lane 0 在 lane 1 之前提交。
-- lane 0 异常会抑制 lane 1 的全部体系结构写入。
-- 当前发射策略把异常单独发射，因此异常最终总是作为 WB 的最老 lane。
-- 中断只注入队首 lane 0，并禁止与 lane 1 同发。
-- 异常跳转到 `EENTRY`，TLB refill 跳转到 `TLBRENTRY`。
-- ERTN 跳转到 `ERA`。
-- refetch 从提交指令的 `PC+4` 重新取指。
-- WB flush 清除 EX/M1/M2、前端在途元数据和指令队列。
-- EX 分支纠错只清除比分支年轻的前端/ID 内容，不清除 M1/M2 中的年老指令。
-
-## 7. LL/SC 和 LLBCTL
-
-Decoder 支持 LoongArch `ll.w`、`sc.w` 的 14 位有符号、左移两位立即数。
-双发射核实现以下语义：
-
-- `ll.w` 按 word load，成功提交时置 LLBit。
-- `sc.w` 为条件 word store；LLBit=1 时写内存并向 `rd` 返回 1，
-  LLBit=0 时不发 DCache 写请求并返回 0。
-- `sc.w` 成功提交后清除 LLBit。
-- CSR `LLBCTL` 地址为 `0x60`。
-- 写 WCLLB 位清除 LLBit。
-- ERTN 时 KLO=1 保留 LLBit一次并清除 KLO；KLO=0 清除 LLBit。
-
-该行为覆盖 chiplab `n81_atomic_ins` 对 ROLLBIT、WCLLB 和 KLO 的检查。
-
-## 8. 顶层接口与双提交
-
-生成模块名为 `core_top`，保留比赛 SoC 所需的 AXI、时钟、复位、中断和
-辅助端口，并提供两组提交接口：
-
-```text
-debug1_wb_pc
-debug1_wb_rf_wen[3:0]
-debug1_wb_rf_wnum[4:0]
-debug1_wb_rf_wdata[31:0]
-```
-
-`debug0` 是年老提交，`debug1` 是年轻提交。通用 chiplab 差分环境应设置
-`CPU_2CMT=y`；只连接 debug0 的 FPGA 顶层可以让 debug1 悬空。
-
-## 9. 构建、测试与受控导出
+## 6. 构建与验证
 
 ```powershell
-# 编译及 ScalaTest
 sbt -batch compile
 sbt -batch test
-
-# 默认直接生成双发射 core_top
-sbt -batch run
-
-# 或显式指定输出目录
 sbt -batch "runMain mycpu.Elaborate --target-dir generated/vivado-dual"
-
-# 使用 WSL Verilator 执行不依赖 Divider IP 的定向 RTL 断言
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_dual_smoke.ps1
-
-# 生成带 SHA-256 manifest 的暂存 RTL；默认不修改 chiplab
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/export_rtl.ps1
 ```
 
-`scripts/export_rtl.ps1` 使用时间戳目录，生成 `rtl-manifest.json`，并明确
-记录仿真 Divider 未包含。只有显式给出 `-Sync -Destination <目录>` 才会
-复制 manifest 列出的文件；脚本拒绝写入 Vivado `project/imports`，也不会
-删除目标目录中的其他文件。
+本机没有原生 Verilator 时，Scala 仿真测试会明确显示 `CANCELED`；仓库的
+`DualSmokeHarness` 可使用 XSim 验证基本发射、队列、BPU/BTB/RAS 不变量。完整
+SoC 程序和最终 WNS 必须在 chiplab 工程中回归，不能以 OOC 综合替代。
 
-### 仿真 Divider
-
-`src/test/resources/div_gen_0_sim.sv` 是与黑盒同端口的仿真专用模型。
-它只用于 Verilator/功能仿真，允许使用 `/` 和 `%`，不得复制到
-`chiplab/IP/myCPU` 或加入 Vivado synthesis file set。硬件实现仍必须在：
-
-```text
-chiplab/IP/myCPU/xilinx_ip/div_gen_0/div_gen_0.xci
-```
-
-提供真正的 Divider Generator output products。
-
-## 10. 当前验证状态与硬件门槛
-
-已完成的本地门槛：
-
-- 双发射源码通过 `sbt compile`。
-- 默认 `mycpu.Elaborate` 通过 CIRCT SystemVerilog elaboration。
-- 完整 Dual `core_top` 在加入仿真 Divider 后通过 Verilator lint。
-- 定向 RTL harness 通过，覆盖双发射相关、队列顺序、4R2W、LL/SC
-  解码、CACOP refetch 和 LLBCTL/KLO。
-
-当前 Windows 环境没有原生 Verilator，ChiselSim ScalaTest 会明确标记为
-`CANCELED`，不会伪装成已执行测试；同一组关键不变量由
-`scripts/run_dual_smoke.ps1` 调用 WSL Verilator 实际执行。配置原生
-Windows Verilator 后可设置 `CHISEL_NATIVE_SIM=1` 启用 ScalaTest。
-
-尚未声称完成的门槛：
-
-- chiplab 完整功能测试与双提交差分；
-- 20 项关闭 `RUN_PERF_NO_DELAY` 的正式性能回归；
-- Vivado synthesis、implementation、WNS 和板级测试；
-- Divider XCI 相关硬件验证。
-
-当前 `design_pack/slack/slack.txt` 的实际记录为 24.375 ns 时钟要求、
-22.001 ns 数据路径和 1.958 ns WNS，对应约 41 MHz 约束；它不能证明
-57.1 MHz。后续必须在同一 Vivado 版本、器件 `xc7a200tfbg676-2`、约束和
-实现策略下，将当前双发射核与 Git 中保存的单发射基线重新测量：
-
-- 必达：完整功能通过，20 项性能程序全部通过；
-- 性能目标：CPU 周期几何平均相对 Git 单发射基线改善至少 25%；
-- 时序目标：50 MHz 下 WNS≥0；
-- 冲刺目标：57.1 MHz 以上；
-- 最终比较指标：相同环境下的实测频率除以周期数，而非单独比较 IPC
-  或文档中的宣称频率。
-
-在双发射核未通过完整 chiplab 回归前，不得把暂存 RTL 直接同步到最终
-Vivado 工程目录。
+RTL 集成和受控同步见 [`NSCSCC_INTEGRATION.md`](NSCSCC_INTEGRATION.md)。

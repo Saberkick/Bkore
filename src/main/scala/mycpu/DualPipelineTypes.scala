@@ -8,6 +8,8 @@ class DualLaneData extends Bundle {
     val src2Read = Bool()
     val serializing = Bool()
     val waitDcache = Bool()
+    val dcacheDone = Bool()
+    val dcacheBank = Bool()
 }
 
 class DualPacket extends Bundle {

@@ -18,12 +18,12 @@ class DualSmokeHarness extends Module {
     when(cycle =/= 15.U) {
         cycle := cycle + 1.U
     }
-    io.done := cycle >= 6.U
+    io.done := cycle >= 15.U
 
     val issue = Module(new DualIssueUnit())
     for (lane <- 0 until 2) {
         issue.io.in(lane) := 0.U.asTypeOf(new DualIssueInfo())
-        issue.io.in(lane).valid := cycle <= 2.U
+        issue.io.in(lane).valid := cycle <= 4.U
     }
     when(cycle === 0.U) {
         issue.io.in(0).regWrite := true.B
@@ -44,6 +44,65 @@ class DualSmokeHarness extends Module {
     when(cycle === 2.U) {
         issue.io.in(1).isBranch := true.B
         assert(issue.io.issueCount === 2.U)
+    }
+    when(cycle === 3.U) {
+        issue.io.in(0).isMem := true.B
+        issue.io.in(1).isMem := true.B
+        issue.io.in(0).cacheable := true.B
+        issue.io.in(1).cacheable := true.B
+        issue.io.in(0).memBank := false.B
+        issue.io.in(1).memBank := true.B
+        assert(issue.io.issueCount === 2.U)
+    }
+    when(cycle === 4.U) {
+        issue.io.in(0).isMdu := true.B
+        issue.io.in(0).isMul := true.B
+        assert(issue.io.issueCount === 2.U)
+    }
+
+    val predictor = Module(new DualBranchPredictor(clearSets = 4))
+    predictor.io.reqValid := cycle === 6.U || cycle === 10.U || cycle === 14.U
+    val predictorPc = Mux(cycle === 10.U, "h1c000008".U,
+        Mux(cycle === 14.U, "h1c002000".U, "h1c000000".U))
+    predictor.io.reqPc := VecInit(predictorPc, predictorPc + 4.U)
+    predictor.io.consume := cycle === 11.U
+    predictor.io.consumeSlot := 0.U
+    predictor.io.flush := false.B
+    predictor.io.rasCommit := 0.U.asTypeOf(new DualRasCommit())
+    predictor.io.update := 0.U.asTypeOf(new DualPredictorUpdate())
+    when(cycle === 4.U) {
+        predictor.io.update.valid := true.B
+        predictor.io.update.pc := "h1c000000".U
+        predictor.io.update.isBranch := true.B
+        predictor.io.update.target := "h1c001000".U
+    }
+    when(cycle === 8.U) {
+        predictor.io.update.valid := true.B
+        predictor.io.update.pc := "h1c000008".U
+        predictor.io.update.isBranch := true.B
+        predictor.io.update.isCall := true.B
+        predictor.io.update.target := "h1c002000".U
+    }
+    when(cycle === 12.U) {
+        predictor.io.update.valid := true.B
+        predictor.io.update.pc := "h1c002000".U
+        predictor.io.update.isBranch := true.B
+        predictor.io.update.isReturn := true.B
+        predictor.io.update.target := 0.U
+    }
+    when(cycle === 7.U) {
+        assert(predictor.io.resultValid)
+        assert(predictor.io.result(0).hit)
+        assert(predictor.io.result(0).taken)
+        assert(predictor.io.result(0).target === "h1c001000".U)
+    }
+    when(cycle === 11.U) {
+        assert(predictor.io.result(0).isCall)
+        assert(predictor.io.result(0).target === "h1c002000".U)
+    }
+    when(cycle === 15.U) {
+        assert(predictor.io.result(0).isReturn)
+        assert(predictor.io.result(0).target === "h1c00000c".U)
     }
 
     val queue = Module(new DualInstructionQueue())

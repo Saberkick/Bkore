@@ -19,10 +19,20 @@ class DualIssueUnit extends Module {
         (io.in(1).src2Read && io.in(1).src2 === io.in(0).dest)
     )
     val waw = slot0Writes && slot1Writes && io.in(0).dest === io.in(1).dest
-    val slot0Control = io.in(0).isBranch || io.in(0).isMdu
+    val lane1SimpleAlu = !io.in(1).isMem && !io.in(1).isBranch &&
+        !io.in(1).isMdu && !io.in(1).isSerializing &&
+        !io.in(1).hasException
+    val slot0BranchUnsafe = io.in(0).isBranch &&
+        (io.in(0).predictedTaken || !lane1SimpleAlu)
+    val slot0MduUnsafe = io.in(0).isDiv ||
+        (io.in(0).isMul && !lane1SimpleAlu) ||
+        (io.in(0).isMdu && !io.in(0).isMul && !io.in(0).isDiv)
+    val slot0Control = slot0BranchUnsafe || slot0MduUnsafe
     val slot1Mdu = io.in(1).isMdu
     val serializing = io.in(0).isSerializing || io.in(1).isSerializing
-    val twoMem = io.in(0).isMem && io.in(1).isMem
+    val twoMem = io.in(0).isMem && io.in(1).isMem &&
+        (io.in(0).memBank === io.in(1).memBank ||
+         !io.in(0).cacheable || !io.in(1).cacheable)
     val branchPair = io.in(1).isBranch && (
         io.in(0).isBranch || io.in(0).isMem || io.in(0).isMdu
     )

@@ -1,101 +1,40 @@
-# 文件说明与改动优化说明
+# mycpu
 
-CPU 的流水线、分支预测、MMU/TLB、Cache、AXI 转接桥和异常处理总体结构见 [`CPU_DESIGN.md`](CPU_DESIGN.md)。
+LoongArch32 顺序双发射 CPU，生成顶层模块名为 `core_top`。本版本以 `f1cb0f8`
+基线为起点，保持现有 AXI/调试接口，不引入乱序、ROB 或 multiplier XCI。
 
-## 1. 文件说明
+主要结构：
 
-### `design_file/`
+- 两拍、双 Bank、1024 项局部历史 BPU，带 BTB/PHT 和 8 项 RAS；
+- 两包深 Issue Buffer 与覆盖所有有效 producer 的 scoreboard；
+- 双 LSU、三个 TLB 查询端口（IF + LSU0 + LSU1）；
+- 16 KiB、2 Bank、每 Bank 8 KiB/2-way 的阻塞式 DCache；
+- RTL/DSP 推断的流水乘法；外部 `div_gen_0` 阻塞式除法。
 
-该目录包含目前最新版本的 Scala 源代码。使用时，将其中的代码复制到原工程的 `src/main` 目录，再执行 SBT 编译与 Chisel elaboration 即可。
-但是由于在MDU方面做了改动，生成的sv文件导入vivado后不能直接使用，还需要配置并生成除法器IP核，详细配置方式在该文件夹下的DIVIDER_IP_VIVADO.md
+详细设计见 [`CPU_DESIGN.md`](CPU_DESIGN.md)。chiplab 集成、受控 RTL 同步和测试
+步骤见 [`NSCSCC_INTEGRATION.md`](NSCSCC_INTEGRATION.md)。除法器 IP 参数见
+[`src/main/scala/mycpu/DIVIDER_IP_VIVADO.md`](src/main/scala/mycpu/DIVIDER_IP_VIVADO.md)。
 
-> 注意：
-> `Elaborate.scala` 中通过 `--target-dir` 指定了 SystemVerilog 输出目录。使用前必须将该路径修改为本机的实际目录，否则生成文件可能被写入错误位置，或者因目录不存在而生成失败。
+## 构建
 
-```scala
-args = Array(
-  "--target-dir",
-  "D:\\Develop\\CPU\\Archive\\mycpu\\generated" // 修改为本机的输出目录
-)
+```powershell
+sbt -batch compile
+sbt -batch test
+sbt -batch "runMain mycpu.Elaborate --target-dir generated/vivado-dual"
 ```
 
-### `pref/`
+生成并按 SHA-256 manifest 同步到 `D:\Develop\chiplab\IP\myCPU`：
 
-该目录保存了在比赛提供的 Vivado 工程中进行性能测试仿真（simulation）得到的结果。当前配置已经关闭 `RUN_PERF_NO_DELAY` 宏，因此记录的是带实际延迟行为的性能测试结果。
-
-目前比赛环境中的功能测试已经全部通过。
-
-### `slack/`
-
-该目录保存了 Vivado 完成 Implementation 后，由 Timing Report 提取的 CPU 最差时序路径。这些路径决定了设计当前的最高工作频率，也是后续 RTL 与布局布线优化的主要依据。注：是最新版本的slack，即支持57.1MHz的版本
-
-目前设计已经优化至约 **57.1 MHz**，WNS 约为 **0.78 ns**，按现有结果估计仍有约 **1 MHz** 的理论提升空间。相关分析方法与报告说明请参考 `nscscc_readme.md` 的 **4.3.3** 节。
-
-## 2. 功能修复与优化说明
-
-以下内容以 `stream_copy` 已经能够正常运行为起点，只记录此后完成的改动。
-
-### 2.1 取指与 Cache 请求优化
-
-原取指逻辑在发出请求后，必须等待 `data_ok` 才能发送下一次请求。由于 Cache 在命中时本身支持背靠背接收请求，这种控制方式会人为插入空拍，使 ICache 全命中时也很可能只能做到约每两拍取得一条指令。
-
-目前已经调整取指侧的请求与响应控制，使其能够利用 Cache 的背靠背接收能力，减少连续命中时的无效等待。该修改保持原有阻塞式 Cache、缺失处理、流水线冲刷以及响应有效性控制语义，不增加 Cache 命中的固定等待周期。
-
-### 2.2 TLB 上电状态修复
-
-原 16 项 TLB 的表项有效位使用未初始化寄存器保存，上电后 `e` 位没有明确清零。如果启动软件没有可靠执行全 TLB 作废，随机有效的表项可能参与地址翻译，造成不可预测的映射结果或异常。
-
-目前已经为 TLB 有效状态增加确定的复位行为，使所有表项在复位后均处于无效状态，避免处理器正确性依赖启动软件额外执行全 TLB 作废。
-
-### 2.3 轻量级分支预测（完全AI生成）
-
-设计中已经加入小型分支预测器，不依赖厂商 IP 核。取指阶段根据历史信息给出预测方向和目标地址，分支在后级得到实际结果后进行校验；预测错误时，仍通过原有流水线冲刷机制恢复到正确取指地址。
-
-该实现的目标是在不增加复杂乱序结构的前提下，降低循环和常见条件分支造成的控制冒险损失，同时保持单发射、顺序执行的五级流水线结构不变。
-
-### 2.4 除法器关键路径优化
-
-原 `div_gen_0` 并不是真正的厂商除法 IP，而是先使用 Verilog 的 `/` 和 `%` 完成组合除法，再将结果延迟 34 拍输出。这种写法可能被综合为面积较大、组合路径很长的除法器，是频率和资源占用的潜在热点。
-
-目前已经将该实现替换为 Vivado Divider Generator IP，并保持处理器原有的请求、等待和结果返回接口语义。工程提供了适用于 Vivado的 IP 配置说明。将代码迁移到新的 Vivado 工程时，需要按照说明重新生成 `div_gen_0`，并确认模块名、端口、位宽、符号模式和流水线延迟与当前封装一致。
-
-这一改动移除了由 `/`、`%` 推导的大型组合除法路径，使除法运算由专用流水化 IP 实现，降低了 MDU 对 CPU 最高频率的影响。
-
-### 2.5 Cache/MEM 最差时序路径优化
-
-时序报告中，最差路径的终点虽然集中在 Cache 请求寄存器和 MEM 级寄存器，但主要延迟并不来自 Cache 或 MEM 本身。多条最差路径实际共享以下逻辑主干：
-
-```text
-MEM 目的寄存器
-  → EX 实时前递选择
-  → 通用 ALU
-  → TLB 查询与表项选择
-  → MMU 异常判断
-  → Cache 请求控制或 MEM 级异常寄存器
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\export_rtl.ps1 `
+  -Sync -Destination D:\Develop\chiplab\IP\myCPU
 ```
 
-针对这条公共长路径，已经完成以下结构优化：
+导出脚本只复制 manifest 中列出的 SystemVerilog 和 `filelist.f`，不会复制测试
+`div_gen_0_sim.sv`、XCI 或 OOC blackbox，也不会修改 Vivado 工程 Tcl/XDC。
 
-- 将操作数前递提前到 ID 级完成，优先级保持为 `EX → MEM → 寄存器堆`，并仅在 ID→EX 握手成功时锁存最终操作数。
-- EX 级直接使用 ID 级已经锁存的操作数，删除 MEM/WB 到 EX 的实时寄存器号比较和前递多路选择。
-- EX 前递输出改为真实且可立即使用的执行结果，保留 load、CSR 和 MDU 等原有冒险暂停规则。
-- 为 load、store 和 CACOP 增加独立的有效地址加法器 `mem_va = src1 + imm`，使 TLB 查询、地址对齐检查和 Cache 地址生成绕过通用 ALU 的多路结果选择。
-- 将 MMU 故障请求门控与异常码编码分离，使用更浅的并行逻辑生成异常码，缩短 Cache 请求使能和 MEM 异常寄存器之前的组合路径。
-- 将 TLB 查询由“16 路优先编码器 + 动态表项读取”改为保持低索引优先级的 4×4 分层选择结构，减少线性优先选择和大规模动态多路器带来的延迟。
-- 删除顶层 MEM/WB→EX 的实时前递连线，保留 EX/MEM→ID 的前递通路。
+## IP 要求
 
-第一轮优化没有直接修改 `Cache.scala` 和 `StageMEM.scala`，原因是报告中的 Cache `req_tag/CE` 与 MEM `ecode/D` 只是公共长路径的终点。直接改写这些寄存器的使能形式无法切断上游的 EX、TLB 和 MMU 组合逻辑。
-
-## 3. Scala/Chisel 到 SystemVerilog 的注意事项 （AI给与的参考）
-
-- Chisel 中的 `when(valid && addr_ok)` 通常会被 Vivado 映射为触发器的时钟使能（CE）。这是正常综合结果，简单改写为 `RegEnable` 或 D 端自反馈通常不会自然改善时序。
-- 原 TLB 写法生成的线性优先选择链和 16 路动态读取并非不可避免。通过调整 Scala/Chisel 的组织方式，可以引导生成更适合综合的分层选择电路。
-- Vivado 在综合和实现过程中会进行逻辑扁平化、吸收与重命名。时序报告中带有 `csr`、`div` 等层级名称的中间 LUT，不一定表示相应逻辑真正来自 CSR 或除法器，仍需结合完整路径判断。
-- 优化前的相关最差路径中，布线延迟约占总数据路径延迟的 75%～77%。Scala/Chisel 结构优化能够缩短逻辑依赖并改善布局机会，但不能直接决定器件上的物理位置。当路径继续由 routing 主导时，应进一步使用 Vivado 的物理优化、扇出复制、Pblock 或 XDC 约束，而不是仅根据综合后的单元名称修改 RTL。
-
-## 4. 当前设计状态
-
-- 保持单发射、顺序执行的五级流水线结构。
-- 保持阻塞式 Cache 和现有总线协议，不改变 Cache 容量、相联度、Cache line 大小及 TLB 项数。
-- 不为 Cache 命中增加额外固定等待周期。
-- 除法 IP、轻量级分支预测、Cache 背靠背请求和 TLB 复位修复均已纳入当前版本。
+- 必须在 Vivado 工程中提供唯一的 `div_gen_0` Divider Generator，并生成 synthesis
+  与 simulation output products。
+- 乘法不需要 IP；不得复制 NOP-Core/NoAXI 的 multiplier XCI。

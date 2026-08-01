@@ -6,8 +6,10 @@ import chisel3._
 class DualFetchEntry extends Bundle {
     val pc              = UInt(32.W)
     val inst            = UInt(32.W)
+    val predictedHit    = Bool()
     val predictedTaken  = Bool()
     val predictedTarget = UInt(32.W)
+    val predictedHistory = UInt(6.W)
     val hasException    = Bool()
     val ecode           = UInt(6.W)
     val esubcode        = UInt(9.W)
@@ -23,8 +25,13 @@ class DualIssueInfo extends Bundle {
     val regWrite      = Bool()
     val dest          = UInt(5.W)
     val isMem         = Bool()
+    val memBank       = Bool()
+    val cacheable     = Bool()
     val isBranch      = Bool()
     val isMdu         = Bool()
+    val isMul         = Bool()
+    val isDiv         = Bool()
+    val predictedTaken = Bool()
     val isSerializing = Bool()
     val hasException  = Bool()
 }
@@ -33,15 +40,30 @@ class DualPredictResult extends Bundle {
     val hit    = Bool()
     val taken  = Bool()
     val target = UInt(32.W)
+    val history = UInt(6.W)
+    val isCall = Bool()
+    val isReturn = Bool()
 }
 
 class DualPredictorUpdate extends Bundle {
     val valid         = Bool()
     val pc            = UInt(32.W)
+    val predictedHit  = Bool()
+    val history       = UInt(6.W)
     val isBranch      = Bool()
     val isConditional = Bool()
+    val isCall        = Bool()
+    val isReturn      = Bool()
     val taken         = Bool()
     val target        = UInt(32.W)
+    val redirect      = Bool()
+}
+
+class DualRasCommit extends Bundle {
+    val valid         = Bool()
+    val isCall        = Bool()
+    val isReturn      = Bool()
+    val returnAddress = UInt(32.W)
 }
 
 object DualIssueBlockReason {

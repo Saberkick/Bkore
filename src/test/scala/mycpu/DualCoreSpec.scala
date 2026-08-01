@@ -26,8 +26,13 @@ class DualIssueUnitSpec extends AnyFlatSpec with ChiselSim with Matchers {
         dut.io.in(lane).regWrite.poke(false.B)
         dut.io.in(lane).dest.poke(0.U)
         dut.io.in(lane).isMem.poke(false.B)
+        dut.io.in(lane).memBank.poke(false.B)
+        dut.io.in(lane).cacheable.poke(true.B)
         dut.io.in(lane).isBranch.poke(false.B)
         dut.io.in(lane).isMdu.poke(false.B)
+        dut.io.in(lane).isMul.poke(false.B)
+        dut.io.in(lane).isDiv.poke(false.B)
+        dut.io.in(lane).predictedTaken.poke(false.B)
         dut.io.in(lane).isSerializing.poke(false.B)
         dut.io.in(lane).hasException.poke(false.B)
     }
@@ -78,7 +83,7 @@ class DualIssueUnitSpec extends AnyFlatSpec with ChiselSim with Matchers {
         }
     }
 
-    it should "allow only a slot1 branch beside a simple instruction" in {
+    it should "allow a safe lane0 or lane1 branch beside a simple instruction" in {
         NativeSimulatorGuard.requireAvailable()
         simulate(new DualIssueUnit()) { dut =>
             clearLane(dut, 0)
@@ -90,8 +95,83 @@ class DualIssueUnitSpec extends AnyFlatSpec with ChiselSim with Matchers {
 
             dut.io.in(0).isBranch.poke(true.B)
             dut.io.in(1).isBranch.poke(false.B)
+            dut.io.issueCount.expect(2.U)
+
+            dut.io.in(0).predictedTaken.poke(true.B)
             dut.io.issueCount.expect(1.U)
             dut.io.blockMask.expect(DualIssueBlockReason.Slot0Ctrl)
+        }
+    }
+
+    it should "pair different-bank cached accesses and a multiply with an ALU" in {
+        NativeSimulatorGuard.requireAvailable()
+        simulate(new DualIssueUnit()) { dut =>
+            clearLane(dut, 0)
+            clearLane(dut, 1)
+            dut.io.in(0).valid.poke(true.B)
+            dut.io.in(1).valid.poke(true.B)
+            dut.io.in(0).isMem.poke(true.B)
+            dut.io.in(1).isMem.poke(true.B)
+            dut.io.in(0).memBank.poke(false.B)
+            dut.io.in(1).memBank.poke(true.B)
+            dut.io.issueCount.expect(2.U)
+
+            dut.io.in(1).memBank.poke(false.B)
+            dut.io.issueCount.expect(1.U)
+            dut.io.blockMask.expect(DualIssueBlockReason.TwoMem)
+
+            dut.io.in(0).isMem.poke(false.B)
+            dut.io.in(1).isMem.poke(false.B)
+            dut.io.in(0).isMdu.poke(true.B)
+            dut.io.in(0).isMul.poke(true.B)
+            dut.io.issueCount.expect(2.U)
+
+            dut.io.in(0).isMul.poke(false.B)
+            dut.io.in(0).isDiv.poke(true.B)
+            dut.io.issueCount.expect(1.U)
+        }
+    }
+}
+
+class DualBranchPredictorSpec extends AnyFlatSpec with ChiselSim {
+    behavior of "DualBranchPredictor"
+
+    it should "return a trained target one cycle after the banked request" in {
+        NativeSimulatorGuard.requireAvailable()
+        simulate(new DualBranchPredictor(clearSets = 4)) { dut =>
+            dut.io.reqValid.poke(false.B)
+            dut.io.reqPc(0).poke("h1c000000".U)
+            dut.io.reqPc(1).poke("h1c000004".U)
+            dut.io.consume.poke(false.B)
+            dut.io.consumeSlot.poke(0.U)
+            dut.io.flush.poke(false.B)
+            dut.io.rasCommit.asUInt.poke(0.U)
+            dut.io.update.asUInt.poke(0.U)
+            dut.clock.step(5)
+
+            dut.io.update.valid.poke(true.B)
+            dut.io.update.pc.poke("h1c000000".U)
+            dut.io.update.isBranch.poke(true.B)
+            dut.io.update.target.poke("h1c001000".U)
+            dut.clock.step()
+            dut.io.update.valid.poke(false.B)
+            dut.clock.step()
+
+            dut.io.reqValid.poke(true.B)
+            dut.clock.step()
+            dut.io.reqValid.poke(false.B)
+            dut.io.resultValid.expect(true.B)
+            dut.io.result(0).hit.expect(true.B)
+            dut.io.result(0).taken.expect(true.B)
+            dut.io.result(0).target.expect("h1c001000".U)
+
+            // F2 can remain stalled after resultValid falls.  The predictor
+            // payload must stay deterministic until the frontend consumes it.
+            dut.clock.step(3)
+            dut.io.resultValid.expect(false.B)
+            dut.io.result(0).hit.expect(true.B)
+            dut.io.result(0).taken.expect(true.B)
+            dut.io.result(0).target.expect("h1c001000".U)
         }
     }
 }

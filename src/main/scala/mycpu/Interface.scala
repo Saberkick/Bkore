@@ -53,8 +53,10 @@ class PipelineData extends Bundle{
     //IF Generated
     val pc              = UInt(32.W)
     val inst            = UInt(32.W)
+    val predictedHit    = Bool()
     val predictedTaken  = Bool()
     val predictedTarget = UInt(32.W)
+    val predictedHistory = UInt(6.W)
 
     //ID Generated
     //Used in EX
