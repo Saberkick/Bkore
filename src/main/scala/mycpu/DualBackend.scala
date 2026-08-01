@@ -181,10 +181,14 @@ class DualBackend extends Module {
     val mulFinished = RegInit(false.B)
     val mulResult = RegInit(0.U(32.W))
     val mulSigned = exReg.lane(0).pipe.mduOp === MduOp.MULH_W
-    val mulProduct = Mux(mulSigned,
-        (exReg.lane(0).pipe.src1_value.asSInt *
-         exReg.lane(0).pipe.src2_value.asSInt).asUInt,
-        exReg.lane(0).pipe.src1_value * exReg.lane(0).pipe.src2_value)
+    // A single sign-extended 33x33 multiply covers both signed and unsigned
+    // products.  The low 64 bits are identical to the corresponding 32x32
+    // result, avoiding two parallel multipliers and a result-wide mux.
+    val mulA = Cat(mulSigned && exReg.lane(0).pipe.src1_value(31),
+        exReg.lane(0).pipe.src1_value).asSInt
+    val mulB = Cat(mulSigned && exReg.lane(0).pipe.src2_value(31),
+        exReg.lane(0).pipe.src2_value).asSInt
+    val mulProduct = (mulA * mulB).asUInt
 
     val divider = Module(new Divider())
     val divStarted = RegInit(false.B)
