@@ -26,8 +26,8 @@ class tlb extends Module {
         //Output
         //Is it founded?
         val s0_found    = Output(Bool())
-        //0-15
-        val s0_index    = Output(UInt(4.W))
+        //0-31
+        val s0_index    = Output(UInt(5.W))
         val s0_ppn      = Output(UInt(20.W))
         //Pagetable Size
         //If 4kb, we use 2^12 (001100)
@@ -43,7 +43,7 @@ class tlb extends Module {
         val s1_va_bit12 = Input(Bool())
         val s1_asid     = Input(UInt(10.W))
         val s1_found    = Output(Bool())
-        val s1_index    = Output(UInt(4.W))
+        val s1_index    = Output(UInt(5.W))
         val s1_ppn      = Output(UInt(20.W))
         val s1_ps       = Output(UInt(6.W))
         val s1_plv      = Output(UInt(2.W))
@@ -57,7 +57,7 @@ class tlb extends Module {
         val s2_va_bit12 = Input(Bool())
         val s2_asid     = Input(UInt(10.W))
         val s2_found    = Output(Bool())
-        val s2_index    = Output(UInt(4.W))
+        val s2_index    = Output(UInt(5.W))
         val s2_ppn      = Output(UInt(20.W))
         val s2_ps       = Output(UInt(6.W))
         val s2_plv      = Output(UInt(2.W))
@@ -75,11 +75,11 @@ class tlb extends Module {
 
         //For TLBWR / TLBFILL to write PTE
         val we      = Input(Bool())
-        val w_index = Input(UInt(4.W))
+        val w_index = Input(UInt(5.W))
         val w_dat   = Input(new TlbEntry())
 
         //For TLBRD to read PTE
-        val r_index = Input(UInt(4.W))
+        val r_index = Input(UInt(5.W))
         val r_dat   = Output(new TlbEntry())
     })
     // 16 项全相联 TLB，使用寄存器阵列和 16 路并行比较实现两个组合查询端口：
@@ -89,8 +89,8 @@ class tlb extends Module {
     // 只有有效位需要复位。如果将整个 TlbEntry 改成 RegInit，会给约 1.5 Kbit 的
     // 页表负载字段都带上复位网络；独立的 tlb_valid 既保证上电后全部无效，
     // 又使未命中表项的其余字段不必复位。
-    val tlb_table = Reg(Vec(16, new TlbEntry()))
-    val tlb_valid = RegInit(VecInit(Seq.fill(16)(false.B)))
+    val tlb_table = Reg(Vec(32, new TlbEntry()))
+    val tlb_valid = RegInit(VecInit(Seq.fill(32)(false.B)))
     //Write a PTE
     when(io.we) {
         tlb_table(io.w_index) := io.w_dat
@@ -117,30 +117,24 @@ class tlb extends Module {
     }
 
     def hierarchicalSelect(matches: Vec[Bool]): (Bool, UInt, TlbEntry) = {
-        val groups = (0 until 4).map { group =>
+        val groups = (0 until 8).map { group =>
             val base = group * 4
             selectGroup(base, (0 until 4).map(offset => matches(base + offset)))
         }
 
         val group_found = VecInit(groups.map(_._1))
         val group_index = PriorityEncoder(group_found.asUInt)
-        val selected_local_index = MuxLookup(group_index, groups(0)._2)(Seq(
-            1.U(2.W) -> groups(1)._2,
-            2.U(2.W) -> groups(2)._2,
-            3.U(2.W) -> groups(3)._2
-        ))
-        val selected_entry = MuxLookup(group_index, groups(0)._3)(Seq(
-            1.U(2.W) -> groups(1)._3,
-            2.U(2.W) -> groups(2)._3,
-            3.U(2.W) -> groups(3)._3
-        ))
+        val selected_local_index = MuxLookup(group_index, groups(0)._2)(
+            (1 until 8).map(group => group.U(3.W) -> groups(group)._2))
+        val selected_entry = MuxLookup(group_index, groups(0)._3)(
+            (1 until 8).map(group => group.U(3.W) -> groups(group)._3))
 
         (group_found.asUInt.orR, Cat(group_index, selected_local_index), selected_entry)
     }
 
     //Search Port 0
-    val match0 = Wire(Vec(16, Bool()))
-    for (i <- 0 until 16) {
+    val match0 = Wire(Vec(32, Bool()))
+    for (i <- 0 until 32) {
         val entry = tlb_table(i)
         val vppn_match = (io.s0_vppn(18, 9) === entry.vppn(18, 9)) && (entry.ps4MB || (io.s0_vppn(8, 0) === entry.vppn(8, 0)))
         match0(i) := tlb_valid(i) && vppn_match && (entry.asid === io.s0_asid || entry.g)
@@ -166,8 +160,8 @@ class tlb extends Module {
     io.s0_ps  := Mux(found0, Mux(hit0.ps4MB, 21.U(6.W), 12.U(6.W)), 0.U)
 
     //Search Port 1
-    val match1 = Wire(Vec(16, Bool()))
-    for (i <- 0 until 16) {
+    val match1 = Wire(Vec(32, Bool()))
+    for (i <- 0 until 32) {
         val entry = tlb_table(i)
         val vppn_match = (io.s1_vppn(18, 9) === entry.vppn(18, 9)) &&  (entry.ps4MB || (io.s1_vppn(8, 0) === entry.vppn(8, 0)))
         match1(i) := tlb_valid(i) && vppn_match && (entry.asid === io.s1_asid || entry.g)
@@ -192,8 +186,8 @@ class tlb extends Module {
     io.s1_ps  := Mux(found1, Mux(hit1.ps4MB, 21.U(6.W), 12.U(6.W)), 0.U)
 
     // Search Port 2 (second LSU lane)
-    val match2 = Wire(Vec(16, Bool()))
-    for (i <- 0 until 16) {
+    val match2 = Wire(Vec(32, Bool()))
+    for (i <- 0 until 32) {
         val entry = tlb_table(i)
         val vppn_match = (io.s2_vppn(18, 9) === entry.vppn(18, 9)) &&
             (entry.ps4MB || (io.s2_vppn(8, 0) === entry.vppn(8, 0)))
@@ -219,7 +213,7 @@ class tlb extends Module {
 
     // INVTLB
     when(io.invtlb_valid) {
-        for (i <- 0 until 16) {
+        for (i <- 0 until 32) {
             val entry = tlb_table(i)
             val cond1 = !entry.g
             val cond2 = entry.g

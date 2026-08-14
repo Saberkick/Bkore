@@ -83,6 +83,10 @@ class PipelineData extends Bundle{
     //EX Generated
     val ex_result       = UInt(32.W)
     val aux_data        = UInt(32.W) //csr or memwdata
+    // Physical address resolved in M1.  Successful loads overwrite
+    // ex_result with their data in M2, so Difftest memory events need a
+    // separate address field that survives through retirement.
+    val memPaddr        = UInt(32.W)
 
     //Exception
     val hasException    = Bool()

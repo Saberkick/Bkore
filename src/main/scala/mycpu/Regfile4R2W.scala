@@ -14,6 +14,11 @@ class Regfile4R2W extends Module {
 
         val inspectAddr = Input(UInt(5.W))
         val inspectData = Output(UInt(32.W))
+
+        // Full architectural view for the simulation-only Difftest adapter.
+        // Use the same write bypass as the normal read ports so the DPI state
+        // observed on a commit edge already contains both retiring writes.
+        val difftestData = Output(Vec(32, UInt(32.W)))
     })
 
     val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
@@ -38,4 +43,7 @@ class Regfile4R2W extends Module {
         io.rdata(port) := readWithBypass(io.raddr(port))
     }
     io.inspectData := readWithBypass(io.inspectAddr)
+    for (index <- 0 until 32) {
+        io.difftestData(index) := readWithBypass(index.U)
+    }
 }

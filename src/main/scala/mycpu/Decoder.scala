@@ -106,12 +106,12 @@ class Decoder extends Module{
         BitPat("b001010_0010_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.w
         BitPat("b001010_1000_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_BU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.bu
         BitPat("b001010_1001_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_HU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.hu
-        BitPat("b001000_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ll.w
+        BitPat("b00100000_??????????????_?????_?????")       -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ll.w
 
         BitPat("b001010_0100_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_B,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.b
         BitPat("b001010_0101_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_H,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.h
         BitPat("b001010_0110_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.w
-        BitPat("b001001_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 1.U, BrType.NOP, 1.U, 1.U), // sc.w
+        BitPat("b00100001_??????????????_?????_?????")       -> row(AluOp.ADD,   LsOp.ST_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 1.U, BrType.NOP, 1.U, 1.U), // sc.w
 
         BitPat("b010011_????_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.NOP,   MduOp.NOP,   Src1.PC, Src2.R,    Imm.SI16,  Dst.RD,  1.U, 0.U, BrType.JIRL,1.U, 0.U), // jirl
         BitPat("b010100_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI26,  Dst.X,   0.U, 0.U, BrType.B,   0.U, 0.U),    // b
@@ -180,7 +180,16 @@ class Decoder extends Module{
     val is_syscall      = inst === BitPat("b000000_0000_1010110_????_????_????_???")
     val is_break        = inst === BitPat("b000000_0000_1010100_????_????_????_???")
     val is_ertn         = inst === BitPat("b0000_0110_0100_1000_0011_1000_0000_0000")
+    val is_idle         = inst === "h06488000".U
     val is_csr          = inst(31, 24) === "h04".U
+    // PRELD is an architecturally optional prefetch hint.  Even when the
+    // implementation chooses not to prefetch, it is still a legal
+    // instruction and must not raise MMU/address exceptions.  Treat it as a
+    // no-side-effect instruction instead of sending it through the load path.
+    val is_preld        = inst === BitPat("b001010_1011_????_????_????_?????_?????")
+    val is_dbar         = inst(31, 15) === "b00111000011100100".U
+    val is_ibar         = inst(31, 15) === "b00111000011100101".U
+    val is_barrier      = is_dbar || is_ibar
 
     val is_rdtime_base  = inst === BitPat("b0000_0000_0000_0000_0110_0???_????_????")
     val is_timer_l      = is_rdtime_base && inst(10) === 0.U
@@ -216,8 +225,11 @@ class Decoder extends Module{
         io.out.csrNum === "h180".U|| // DMW0
         io.out.csrNum === "h181".U   // DMW1
     )
+    // The backend drains all older work before a serializing/refetch
+    // instruction and refetches at PC+4 after it retires.  This implements a
+    // full DBAR and makes post-IBAR instruction fetch observe older stores.
     io.out.is_refetch := is_csr_mmu_write || is_tlbrd || is_tlbwr ||
-        is_tlbfill || is_invtlb || is_cacop
+        is_tlbfill || is_invtlb || is_cacop || is_barrier
 
     io.out.csrWe        := (is_csr && (rj =/= 0.U)) || is_tlbsrch
     io.out.isCsr        := is_csr || is_rdcntid
@@ -242,11 +254,11 @@ class Decoder extends Module{
 
     io.out.is_cacop := is_cacop
     io.out.cacop_op := inst(4, 0)
-    io.out.isLL := inst(31, 26) === "b001000".U
-    io.out.isSC := inst(31, 26) === "b001001".U
+    io.out.isLL := inst(31, 24) === "h20".U
+    io.out.isSC := inst(31, 24) === "h21".U
 
     val inst_valid      =   (alu_s =/= AluOp.NOP) || (ls_s =/= LsOp.NOP) || (mdu_s =/= MduOp.NOP) || (br_t =/= BrType.NOP) || 
-                            is_syscall || is_break || is_ertn || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop
+                            is_syscall || is_break || is_ertn || is_idle || is_preld || is_barrier || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop
 
     io.out.hasException := !inst_valid || is_syscall || is_break
     io.out.ecode        :=  Mux(is_syscall, "h0B".U(6.W), 

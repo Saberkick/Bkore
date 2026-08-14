@@ -31,7 +31,7 @@ class DualBackend extends Module {
         val tlbVaBit12 = Output(Vec(2, Bool()))
         val tlbAsid = Output(Vec(2, UInt(10.W)))
         val tlbFound = Input(Vec(2, Bool()))
-        val tlbIndex = Input(Vec(2, UInt(4.W)))
+        val tlbIndex = Input(Vec(2, UInt(5.W)))
         val tlbPpn = Input(Vec(2, UInt(20.W)))
         val tlbPs = Input(Vec(2, UInt(6.W)))
         val tlbPlv = Input(Vec(2, UInt(2.W)))
@@ -40,9 +40,9 @@ class DualBackend extends Module {
         val tlbV = Input(Vec(2, Bool()))
 
         val tlbWe = Output(Bool())
-        val tlbWIndex = Output(UInt(4.W))
+        val tlbWIndex = Output(UInt(5.W))
         val tlbWData = Output(new TlbEntry())
-        val tlbRIndex = Output(UInt(4.W))
+        val tlbRIndex = Output(UInt(5.W))
         val tlbRData = Input(new TlbEntry())
         val invtlbValid = Output(Bool())
         val invtlbOp = Output(UInt(5.W))
@@ -60,8 +60,21 @@ class DualBackend extends Module {
     val emptyPacket = 0.U.asTypeOf(new DualPacket())
     val exReg = RegInit(emptyPacket)
     val m1Reg = RegInit(emptyPacket)
+    val m1bReg = RegInit(emptyPacket)
     val m2Reg = RegInit(emptyPacket)
     val wbReg = RegInit(emptyPacket)
+
+    // M1a drives the two LSU TLB ports.  M1b consumes a registered copy of
+    // each result, keeping the full-associative compare out of the DCache
+    // request/ready and frontend credit paths.
+    val m1bTlbFound = RegInit(VecInit(Seq.fill(2)(false.B)))
+    val m1bTlbIndex = RegInit(VecInit(Seq.fill(2)(0.U(5.W))))
+    val m1bTlbPpn   = RegInit(VecInit(Seq.fill(2)(0.U(20.W))))
+    val m1bTlbPs    = RegInit(VecInit(Seq.fill(2)(0.U(6.W))))
+    val m1bTlbPlv   = RegInit(VecInit(Seq.fill(2)(0.U(2.W))))
+    val m1bTlbMat   = RegInit(VecInit(Seq.fill(2)(0.U(2.W))))
+    val m1bTlbD     = RegInit(VecInit(Seq.fill(2)(false.B)))
+    val m1bTlbV     = RegInit(VecInit(Seq.fill(2)(false.B)))
 
     // Two packet issue buffer.  Its registered occupancy is the credit seen
     // by the frontend queue, so M1/DCache/TLB backpressure cannot propagate
@@ -75,6 +88,7 @@ class DualBackend extends Module {
     def packetValid(packet: DualPacket): Bool = packet.valid(0) || packet.valid(1)
     val exValid = packetValid(exReg)
     val m1Valid = packetValid(m1Reg)
+    val m1bValid = packetValid(m1bReg)
     val m2Valid = packetValid(m2Reg)
     val wbValid = packetValid(wbReg)
 
@@ -109,12 +123,16 @@ class DualBackend extends Module {
     csr.io.excValid := wbFlush && wbFaultPipe.hasException
     csr.io.excEcode := wbFaultPipe.ecode
     csr.io.excEsubcode := wbFaultPipe.esubcode
-    csr.io.excPc := wbFaultPipe.pc
+    val wbIdleInterrupt = wbFaultPipe.hasException &&
+        wbFaultPipe.ecode === ExcCode.INT && wbFaultPipe.inst === "h06488000".U
+    val wbExceptionPc = Mux(wbIdleInterrupt, wbFaultPipe.pc + 4.U, wbFaultPipe.pc)
+    csr.io.excPc := wbExceptionPc
     val wbFetchException = wbFaultPipe.ecode === ExcCode.ADEF ||
         wbFaultPipe.ecode === ExcCode.PIF ||
         wbFaultPipe.inst === "h03400000".U
     csr.io.excAddr := Mux(wbFetchException, wbFaultPipe.pc, wbFaultPipe.ex_result)
-    csr.io.ertnFlush := wbFlush && wbFaultPipe.inst_ertn
+    csr.io.ertnFlush := wbFlush && wbFaultPipe.inst_ertn &&
+        !wbFaultPipe.hasException
     csr.io.hw_int_in := io.hwInterrupt
 
     csr.io.tlbrd_we := wbReg.valid(0) && !wbReg.lane(0).pipe.hasException &&
@@ -130,7 +148,10 @@ class DualBackend extends Module {
     val wbFinalData = Wire(Vec(2, UInt(32.W)))
     for (lane <- 0 until 2) {
         wbFinalData(lane) := Mux(wbReg.lane(lane).pipe.isCsr,
-            csr.io.readData, wbReg.lane(lane).pipe.ex_result)
+            csr.io.readData,
+            Mux(wbReg.lane(lane).pipe.isSC,
+                wbReg.lane(lane).pipe.aux_data,
+                wbReg.lane(lane).pipe.ex_result))
     }
 
     val suppressLane1 = wbReg.valid(0) && wbReg.lane(0).pipe.hasException
@@ -168,7 +189,7 @@ class DualBackend extends Module {
     io.rasCommit.isReturn := wbRasPipe.inst === "h4c000020".U
     io.rasCommit.returnAddress := wbRasPipe.pc + 4.U
 
-    val tlbFillIndex = RegInit(0.U(4.W))
+    val tlbFillIndex = RegInit(0.U(5.W))
     tlbFillIndex := tlbFillIndex + 1.U
     val wbTlbWrite = wbReg.valid(0) && !wbReg.lane(0).pipe.hasException &&
         (wbReg.lane(0).pipe.tlbOp === TlbOp.WR ||
@@ -183,6 +204,99 @@ class DualBackend extends Module {
         wbReg.lane(0).pipe.tlbOp === TlbOp.INV
     io.invtlbValid := wbInvtlb
     io.invtlbOp := wbReg.lane(0).pipe.invtlb_op
+
+    // Verilator Difftest retirement stream.  Lane 0 is always older; any
+    // redirect or exception in lane 0 suppresses the younger lane 1 event.
+    // IDLE is retired before its wake-up interrupt is reported.
+    val wbRetire = Wire(Vec(2, Bool()))
+    wbRetire(0) := wbReg.valid(0) &&
+        (!wbReg.lane(0).pipe.hasException || wbIdleInterrupt)
+    wbRetire(1) := wbReg.valid(1) && !wbReg.lane(1).pipe.hasException &&
+        !wbFault0
+
+    for (lane <- 0 until 2) {
+        val pipe = wbReg.lane(lane).pipe
+        val isCounterInstruction = pipe.rdtimel || pipe.rdtimeh ||
+            (pipe.isCsr && pipe.csrNum === CsrAddr.TID &&
+             pipe.inst(31, 24) === 0.U)
+        val difftestCommit = Module(new DifftestInstrCommitSim())
+        difftestCommit.clock := clock
+        difftestCommit.coreid := 0.U
+        difftestCommit.index := lane.U
+        difftestCommit.valid := wbRetire(lane)
+        difftestCommit.pc := pipe.pc.pad(64)
+        difftestCommit.instr := pipe.inst
+        difftestCommit.skip := false.B
+        difftestCommit.is_TLBFILL := wbRetire(lane) &&
+            pipe.tlbOp === TlbOp.FILL
+        difftestCommit.TLBFILL_index := (if (lane == 0) io.tlbWIndex else 0.U)
+        difftestCommit.is_CNTinst := wbRetire(lane) && isCounterInstruction
+        difftestCommit.timer_64_value := Mux(pipe.rdtimel,
+            Cat(io.timer(63, 32), wbFinalData(lane)),
+            Mux(pipe.rdtimeh,
+                Cat(wbFinalData(lane), io.timer(31, 0)), io.timer))
+        difftestCommit.wen := wbRetire(lane) && wbRfWe(lane) &&
+            pipe.destReg =/= 0.U
+        difftestCommit.wdest := pipe.destReg.pad(8)
+        difftestCommit.wdata := wbFinalData(lane).pad(64)
+        difftestCommit.csr_rstat := wbRetire(lane) && pipe.isCsr &&
+            pipe.csrNum === CsrAddr.ESTAT
+        difftestCommit.csr_data := wbFinalData(lane)
+
+        val loadKind = Mux(pipe.isLL, "h20".U(8.W),
+            MuxLookup(pipe.lsOp, 0.U(8.W))(Seq(
+                LsOp.LD_B  -> "h01".U,
+                LsOp.LD_BU -> "h02".U,
+                LsOp.LD_H  -> "h04".U,
+                LsOp.LD_HU -> "h08".U,
+                LsOp.LD_W  -> "h10".U)))
+        val difftestLoad = Module(new DifftestLoadEventSim())
+        difftestLoad.clock := clock
+        difftestLoad.coreid := 0.U
+        difftestLoad.index := lane.U
+        difftestLoad.valid := Mux(wbRetire(lane) && pipe.resFromMem,
+            loadKind, 0.U)
+        difftestLoad.paddr := pipe.memPaddr.pad(64)
+        difftestLoad.vaddr := (pipe.src1_value + pipe.imm).pad(64)
+
+        val storeKind = Mux(pipe.isSC, "h08".U(8.W),
+            MuxLookup(pipe.lsOp, 0.U(8.W))(Seq(
+                LsOp.ST_B -> "h01".U,
+                LsOp.ST_H -> "h02".U,
+                LsOp.ST_W -> "h04".U)))
+        val difftestStore = Module(new DifftestStoreEventSim())
+        difftestStore.clock := clock
+        difftestStore.coreid := 0.U
+        difftestStore.index := lane.U
+        difftestStore.valid := Mux(wbRetire(lane) && pipe.memWe,
+            storeKind, 0.U)
+        difftestStore.storePAddr := pipe.memPaddr.pad(64)
+        difftestStore.storeVAddr := (pipe.src1_value + pipe.imm).pad(64)
+        val storePayload = MuxLookup(pipe.lsOp, pipe.src2_value)(Seq(
+            LsOp.ST_B -> Cat(0.U(24.W), pipe.src2_value(7, 0)),
+            LsOp.ST_H -> Cat(0.U(16.W), pipe.src2_value(15, 0)),
+            LsOp.ST_W -> pipe.src2_value))
+        val storeShift = Cat(pipe.memPaddr(1, 0), 0.U(3.W))
+        difftestStore.storeData := (storePayload.pad(64) << storeShift)(63, 0)
+    }
+
+    val difftestGpr = Module(new DifftestGRegStateSim())
+    difftestGpr.clock := clock
+    difftestGpr.coreid := 0.U
+    for (index <- 0 until 32) {
+        difftestGpr.gpr(index) := regfile.io.difftestData(index).pad(64)
+    }
+
+    val difftestExcp = Module(new DifftestExcpEventSim())
+    difftestExcp.clock := clock
+    difftestExcp.coreid := 0.U
+    difftestExcp.excp_valid := csr.io.excValid
+    difftestExcp.eret := csr.io.ertnFlush
+    difftestExcp.intrNo := Mux(wbFaultPipe.ecode === ExcCode.INT,
+        csr.io.interruptPending(12, 2).pad(32), 0.U)
+    difftestExcp.cause := wbFaultPipe.ecode.pad(32)
+    difftestExcp.exceptionPC := wbExceptionPc.pad(64)
+    difftestExcp.exceptionInst := wbFaultPipe.inst
 
     val wbTarget = Mux(wbFaultPipe.hasException,
         Mux(wbFaultPipe.ecode === ExcCode.TLBR, csr.io.tlbrentryOut, csr.io.eentryOut),
@@ -248,6 +362,7 @@ class DualBackend extends Module {
         (exIsDiv && (divFinished || divider.io.done))
 
     val exForwardResult = Wire(Vec(2, UInt(32.W)))
+    val exAlignmentException = Wire(Vec(2, Bool()))
     for (lane <- 0 until 2) {
         val pipe = exReg.lane(lane).pipe
         val src1 = pipe.src1_value
@@ -263,8 +378,9 @@ class DualBackend extends Module {
         val isMemAddress = pipe.resFromMem || pipe.memWe || pipe.is_cacop
         val csrMask = Mux(pipe.src1_addr === 0.U, 0.U,
             Mux(pipe.src1_addr === 1.U, "hffffffff".U, src1))
-        val baseResult = Mux(pipe.isSC, csr.io.llbit,
-            Mux(isMemAddress, memVa, alus(lane).io.res))
+        // Keep the LSU virtual address in ex_result for SC as well.  The SC
+        // architectural success value is carried separately in aux_data.
+        val baseResult = Mux(isMemAddress, memVa, alus(lane).io.res)
         val nonMduResult = Mux(pipe.isCpucfg, 0.U,
             Mux(pipe.rdtimel, io.timer(31, 0),
             Mux(pipe.rdtimeh, io.timer(63, 32),
@@ -279,17 +395,22 @@ class DualBackend extends Module {
         val isWord = pipe.lsOp === LsOp.LD_W || pipe.lsOp === LsOp.ST_W
         val isHalf = pipe.lsOp === LsOp.LD_H || pipe.lsOp === LsOp.LD_HU ||
             pipe.lsOp === LsOp.ST_H
-        val alignmentException = exReg.valid(lane) &&
+        exAlignmentException(lane) := exReg.valid(lane) &&
             (pipe.resFromMem || pipe.memWe) &&
             ((isWord && memVa(1, 0) =/= 0.U) || (isHalf && memVa(0)))
 
         exOut.lane(lane).pipe.ex_result := result
-        exOut.lane(lane).pipe.aux_data := Mux(pipe.isCsr, csrMask, src2)
-        exOut.lane(lane).pipe.hasException := pipe.hasException || alignmentException
+        exOut.lane(lane).pipe.aux_data :=
+            Mux(pipe.isSC, csr.io.llbit, Mux(pipe.isCsr, csrMask, src2))
+        exOut.lane(lane).pipe.hasException :=
+            pipe.hasException || exAlignmentException(lane)
         exOut.lane(lane).pipe.ecode := Mux(pipe.hasException, pipe.ecode,
-            Mux(alignmentException, ExcCode.ALE, 0.U))
+            Mux(exAlignmentException(lane), ExcCode.ALE, 0.U))
+        exOut.lane(lane).serializing :=
+            exReg.lane(lane).serializing || exAlignmentException(lane)
         exOut.lane(lane).pipe.memWe := pipe.memWe && (!pipe.isSC || csr.io.llbit)
     }
+    val exLateFault = exAlignmentException.asUInt.orR
 
     // Branch outcome and predictor update are meaningful only when EX advances.
     val branchTaken = Wire(Vec(2, Bool()))
@@ -317,10 +438,33 @@ class DualBackend extends Module {
     }
 
     // ---------------------------------------------------------------------
-    // M1: DTLB, permission/alignment result and DCache request
+    // M1a: drive both LSU TLB search ports from the registered EX packet.
     // ---------------------------------------------------------------------
     val wbInvVppn = wbReg.lane(0).pipe.src2_value(31, 13)
     val wbInvAsid = wbReg.lane(0).pipe.src1_value(9, 0)
+    for (lane <- 0 until 2) {
+        val pipe = m1Reg.lane(lane).pipe
+        val va = pipe.ex_result
+        val isInv = pipe.tlbOp === TlbOp.INV
+        val isSearch = pipe.tlbOp === TlbOp.SRCH
+        if (lane == 0) {
+            io.tlbVppn(lane) := Mux(wbInvtlb, wbInvVppn,
+                Mux(isInv, pipe.src2_value(31, 13),
+                Mux(isSearch, csr.io.mmu_config.tlbehi.vppn, va(31, 13))))
+            io.tlbAsid(lane) := Mux(wbInvtlb, wbInvAsid,
+                Mux(isInv, pipe.src1_value(9, 0),
+                    csr.io.mmu_config.asid.asid))
+        } else {
+            io.tlbVppn(lane) := va(31, 13)
+            io.tlbAsid(lane) := csr.io.mmu_config.asid.asid
+        }
+        io.tlbVaBit12(lane) := va(12)
+    }
+
+    // ---------------------------------------------------------------------
+    // M1b: evaluate both registered translations and issue banked DCache
+    // requests atomically.
+    // ---------------------------------------------------------------------
     val m1Direct = csr.io.mmu_config.crmd.da === 1.U &&
         csr.io.mmu_config.crmd.pg === 0.U
     val m1Va = Wire(Vec(2, UInt(32.W)))
@@ -334,49 +478,39 @@ class DualBackend extends Module {
     val m1MmuFault = Wire(Vec(2, Bool()))
     val m1FaultCode = Wire(Vec(2, UInt(6.W)))
     val m1Uncached = Wire(Vec(2, Bool()))
-    val m1Out = WireDefault(m1Reg)
+    val m1Out = WireDefault(m1bReg)
 
     for (lane <- 0 until 2) {
-        val pipe = m1Reg.lane(lane).pipe
-        val valid = m1Reg.valid(lane)
+        val pipe = m1bReg.lane(lane).pipe
+        val valid = m1bReg.valid(lane)
         val va = pipe.ex_result
         m1Va(lane) := va
-        val isInv = pipe.tlbOp === TlbOp.INV
         m1IsSearch(lane) := pipe.tlbOp === TlbOp.SRCH
-
-        if (lane == 0) {
-            io.tlbVppn(lane) := Mux(wbInvtlb, wbInvVppn,
-                Mux(isInv, pipe.src2_value(31, 13),
-                Mux(m1IsSearch(lane), csr.io.mmu_config.tlbehi.vppn,
-                    va(31, 13))))
-            io.tlbAsid(lane) := Mux(wbInvtlb, wbInvAsid,
-                Mux(isInv, pipe.src1_value(9, 0), csr.io.mmu_config.asid.asid))
-        } else {
-            io.tlbVppn(lane) := va(31, 13)
-            io.tlbAsid(lane) := csr.io.mmu_config.asid.asid
-        }
-        io.tlbVaBit12(lane) := va(12)
 
         val dmw0Hit = csr.io.mmu_config.crmd.pg === 1.U &&
             !csr.io.mmu_config.crmd.da.asBool &&
             va(31, 29) === csr.io.mmu_config.dmw0.vseg &&
-            ((csr.io.mmu_config.crmd.plv === 0.U && csr.io.mmu_config.dmw0.plv0.asBool) ||
-             (csr.io.mmu_config.crmd.plv === 3.U && csr.io.mmu_config.dmw0.plv3.asBool))
+            ((csr.io.mmu_config.crmd.plv === 0.U &&
+              csr.io.mmu_config.dmw0.plv0.asBool) ||
+             (csr.io.mmu_config.crmd.plv === 3.U &&
+              csr.io.mmu_config.dmw0.plv3.asBool))
         val dmw1Hit = csr.io.mmu_config.crmd.pg === 1.U &&
             !csr.io.mmu_config.crmd.da.asBool &&
             va(31, 29) === csr.io.mmu_config.dmw1.vseg &&
-            ((csr.io.mmu_config.crmd.plv === 0.U && csr.io.mmu_config.dmw1.plv0.asBool) ||
-             (csr.io.mmu_config.crmd.plv === 3.U && csr.io.mmu_config.dmw1.plv3.asBool))
+            ((csr.io.mmu_config.crmd.plv === 0.U &&
+              csr.io.mmu_config.dmw1.plv0.asBool) ||
+             (csr.io.mmu_config.crmd.plv === 3.U &&
+              csr.io.mmu_config.dmw1.plv3.asBool))
         val dmwHit = dmw0Hit || dmw1Hit
         val dmwPa = Mux(dmw0Hit,
             Cat(csr.io.mmu_config.dmw0.pseg, va(28, 0)),
             Cat(csr.io.mmu_config.dmw1.pseg, va(28, 0)))
-        val tlbPa = Mux(io.tlbPs(lane) === 12.U,
-            Cat(io.tlbPpn(lane), va(11, 0)),
-            Cat(io.tlbPpn(lane)(19, 9), va(20, 0)))
+        val tlbPa = Mux(m1bTlbPs(lane) === 12.U,
+            Cat(m1bTlbPpn(lane), va(11, 0)),
+            Cat(m1bTlbPpn(lane)(19, 9), va(20, 0)))
         m1Pa(lane) := Mux(m1Direct, va,
             Mux(dmwHit, dmwPa,
-            Mux(io.tlbFound(lane) && io.tlbV(lane), tlbPa, va)))
+            Mux(m1bTlbFound(lane) && m1bTlbV(lane), tlbPa, va)))
         val mapped = csr.io.mmu_config.crmd.pg === 1.U &&
             !csr.io.mmu_config.crmd.da.asBool && !dmwHit
 
@@ -386,15 +520,20 @@ class DualBackend extends Module {
             pipe.cacop_op(2, 0) === 1.U
         m1IcacheCacop(lane) := valid && pipe.is_cacop &&
             pipe.cacop_op(2, 0) === 0.U
-        m1IsAccess(lane) := m1Load(lane) || m1Store(lane) || m1DcacheCacop(lane)
-        val refill = m1IsAccess(lane) && mapped && !io.tlbFound(lane)
-        val ppi = m1IsAccess(lane) && mapped && io.tlbFound(lane) &&
-            io.tlbV(lane) && csr.io.mmu_config.crmd.plv > io.tlbPlv(lane)
-        val pil = (m1Load(lane) || m1DcacheCacop(lane)) && mapped &&
-            io.tlbFound(lane) && !io.tlbV(lane)
-        val pis = m1Store(lane) && mapped && io.tlbFound(lane) && !io.tlbV(lane)
-        val pme = m1Store(lane) && mapped && io.tlbFound(lane) &&
-            io.tlbV(lane) && !ppi && !io.tlbD(lane)
+        m1IsAccess(lane) :=
+            m1Load(lane) || m1Store(lane) || m1DcacheCacop(lane)
+        val mmuAccess = m1IsAccess(lane) || m1IcacheCacop(lane)
+        val refill = mmuAccess && mapped && !m1bTlbFound(lane)
+        val ppi = mmuAccess && mapped && m1bTlbFound(lane) &&
+            m1bTlbV(lane) &&
+            csr.io.mmu_config.crmd.plv > m1bTlbPlv(lane)
+        val pil = (m1Load(lane) || m1DcacheCacop(lane) ||
+            m1IcacheCacop(lane)) && mapped && m1bTlbFound(lane) &&
+            !m1bTlbV(lane)
+        val pis = m1Store(lane) && mapped && m1bTlbFound(lane) &&
+            !m1bTlbV(lane)
+        val pme = m1Store(lane) && mapped && m1bTlbFound(lane) &&
+            m1bTlbV(lane) && !ppi && !m1bTlbD(lane)
         m1MmuFault(lane) := refill || ppi || pil || pis || pme
         m1FaultCode(lane) :=
             (Fill(6, refill) & ExcCode.TLBR) |
@@ -406,7 +545,7 @@ class DualBackend extends Module {
         val dmwMat = Mux(dmw0Hit, csr.io.mmu_config.dmw0.mat,
             csr.io.mmu_config.dmw1.mat)
         val mat = Mux(m1Direct, csr.io.mmu_config.crmd.datm,
-            Mux(dmwHit, dmwMat, io.tlbMat(lane)))
+            Mux(dmwHit, dmwMat, m1bTlbMat(lane)))
         m1Uncached(lane) := mat === 0.U
 
         when(valid) {
@@ -414,39 +553,44 @@ class DualBackend extends Module {
                 pipe.hasException || m1MmuFault(lane)
             m1Out.lane(lane).pipe.ecode := Mux(
                 pipe.hasException, pipe.ecode, m1FaultCode(lane))
+            m1Out.lane(lane).serializing :=
+                m1bReg.lane(lane).serializing || m1MmuFault(lane)
             when(m1IsSearch(lane)) {
                 m1Out.lane(lane).pipe.ex_result :=
-                    Cat(!io.tlbFound(lane), 0.U(27.W), io.tlbIndex(lane))
-                m1Out.lane(lane).pipe.aux_data :=
-                    Mux(io.tlbFound(lane), "h8000000f".U, "h80000000".U)
+                    Cat(!m1bTlbFound(lane), 0.U(26.W),
+                        m1bTlbIndex(lane))
+                m1Out.lane(lane).pipe.aux_data := Mux(
+                    m1bTlbFound(lane), "h8000001f".U,
+                    "h80000000".U)
             }
+            m1Out.lane(lane).pipe.memPaddr := m1Pa(lane)
         }
     }
 
-    val lane0FaultBlocksLane1 = m1Reg.valid(0) &&
-        (m1Reg.lane(0).pipe.hasException || m1MmuFault(0))
+    val lane0FaultBlocksLane1 = m1bReg.valid(0) &&
+        (m1bReg.lane(0).pipe.hasException || m1MmuFault(0))
     val dcacheRequest = Wire(Vec(2, Bool()))
     dcacheRequest(0) := m1IsAccess(0) && !m1MmuFault(0)
-    dcacheRequest(1) := m1IsAccess(1) && !m1MmuFault(1) && !lane0FaultBlocksLane1
+    dcacheRequest(1) := m1IsAccess(1) && !m1MmuFault(1) &&
+        !lane0FaultBlocksLane1
+    val m1LateFault = m1bValid && m1MmuFault.asUInt.orR
 
     // m2AllowIn is declared below; this wire breaks declaration order.
     val m2AllowWire = Wire(Bool())
     val dualDcacheRequest = dcacheRequest.asUInt.andR
     val bothBanksReady = io.dcache(0).addr_ok && io.dcache(1).addr_ok
     for (lane <- 0 until 2) {
-        val pipe = m1Reg.lane(lane).pipe
+        val pipe = m1bReg.lane(lane).pipe
         val cacopIndex = pipe.is_cacop && pipe.cacop_op(4, 3) =/= "b10".U
         val address = Cat(Mux(cacopIndex, m1Va(lane)(31, 12),
             m1Pa(lane)(31, 12)), m1Va(lane)(11, 0))
         val word = pipe.lsOp === LsOp.LD_W || pipe.lsOp === LsOp.ST_W
-        val half = pipe.lsOp === LsOp.LD_H || pipe.lsOp === LsOp.LD_HU ||
-            pipe.lsOp === LsOp.ST_H
+        val half = pipe.lsOp === LsOp.LD_H ||
+            pipe.lsOp === LsOp.LD_HU || pipe.lsOp === LsOp.ST_H
         val byteMask = "b0001".U(4.W) << m1Va(lane)(1, 0)
-        val halfMask = Mux(m1Va(lane)(1), "b1100".U(4.W), "b0011".U(4.W))
+        val halfMask = Mux(m1Va(lane)(1),
+            "b1100".U(4.W), "b0011".U(4.W))
 
-        // For a pair, assert both valids only after both banks advertise
-        // readiness.  This makes request acceptance atomic and avoids losing a
-        // fast-bank response while the other bank is still blocked.
         io.dcache(lane).request := dcacheRequest(lane)
         io.dcache(lane).valid := dcacheRequest(lane) && m2AllowWire &&
             (!dualDcacheRequest || bothBanksReady)
@@ -457,6 +601,8 @@ class DualBackend extends Module {
         io.dcache(lane).wdata := Mux(word, pipe.src2_value,
             Mux(half, Fill(2, pipe.src2_value(15, 0)),
                 Fill(4, pipe.src2_value(7, 0))))
+        io.dcache(lane).access_size :=
+            Mux(word, 2.U, Mux(half, 1.U, 0.U))
         io.dcache(lane).uncached := m1Uncached(lane)
         io.dcache(lane).cacop_en := m1DcacheCacop(lane)
         io.dcache(lane).cacop_op := pipe.cacop_op(4, 3)
@@ -517,10 +663,13 @@ class DualBackend extends Module {
     // ---------------------------------------------------------------------
     // Elastic stage readiness and branch event
     // ---------------------------------------------------------------------
-    val m1ReadyGo = !m1Valid || dcacheRequestsAccepted
-    val m1AllowIn = !m1Valid || (m1ReadyGo && m2AllowIn)
+    val m1bReadyGo = !m1bValid || dcacheRequestsAccepted
+    val m1bAllowIn = !m1bValid || (m1bReadyGo && m2AllowIn)
+    val m1bFire = m1bValid && m1bReadyGo && m2AllowIn
+    val m1Fire = m1Valid && m1bAllowIn && !m1LateFault
+    val m1AllowIn = !m1Valid || m1Fire
     val exAllowIn = !exValid || (exReadyGo && m1AllowIn)
-    val exFire = exValid && exReadyGo && m1AllowIn
+    val exFire = exValid && exReadyGo && m1AllowIn && !m1LateFault
 
     val lane0ArchitecturalBranchEvent = exReg.valid(0) &&
         (exReg.lane(0).pipe.brType =/= BrType.NOP ||
@@ -588,7 +737,15 @@ class DualBackend extends Module {
         val dec = decoders(lane).io.out
         val op6 = inst(31, 26)
         val isStore = op6 === "b001010".U && inst(24)
-        val isSc = op6 === "b001001".U
+        val isSc = inst(31, 24) === "h21".U
+        val isIdle = inst === "h06488000".U
+        val isPrivilegedCacop = dec.is_cacop &&
+            dec.cacop_op(4, 3) =/= "b10".U
+        val isPrivileged = inst(31, 24) === "h04".U ||
+            dec.tlbOp =/= TlbOp.NOP || isPrivilegedCacop ||
+            dec.inst_ertn || isIdle
+        val privilegeViolation = csr.io.mmu_config.crmd.plv =/= 0.U &&
+            isPrivileged
         val isBranch = op6 === BitPat("b01011?") || op6 === BitPat("b0110??")
         val isCsrWrite = inst(31, 24) === "h04".U && inst(9, 5) =/= 0.U
         val src1 = inst(9, 5)
@@ -639,16 +796,18 @@ class DualBackend extends Module {
 
         val interrupt = if (lane == 0) csr.io.hasInt else false.B
         pipe.hasException := interrupt || io.fetchBits(lane).hasException ||
-            dec.hasException
+            dec.hasException || privilegeViolation
         pipe.ecode := Mux(interrupt, ExcCode.INT,
             Mux(io.fetchBits(lane).hasException, io.fetchBits(lane).ecode,
-                dec.ecode))
+                Mux(dec.hasException, dec.ecode,
+                    Mux(privilegeViolation, ExcCode.IPE, 0.U))))
         pipe.esubcode := io.fetchBits(lane).esubcode
         decodedPipe(lane).src1Read := dec.src1_read
         decodedPipe(lane).src2Read := dec.src2_read
         decodedPipe(lane).serializing :=
             dec.isCsr || dec.tlbOp =/= TlbOp.NOP || dec.is_cacop ||
-            dec.inst_ertn || dec.isLL || dec.isSC
+            dec.is_refetch || dec.inst_ertn || dec.isLL || dec.isSC ||
+            isIdle || pipe.hasException
 
         issue.io.in(lane).valid := io.fetchValid(lane)
         issue.io.in(lane).src1Read := dec.src1_read
@@ -690,12 +849,17 @@ class DualBackend extends Module {
             pipe.destReg, exForwardResult(lane),
             !pipe.resFromMem && !pipe.isCsr && !pipe.resFromMulDiv)
     }
-    val m1Producers = (1 to 0 by -1).map { lane =>
+    val m1aProducers = (1 to 0 by -1).map { lane =>
         // M1 forwarding must come from the stage register.  m1Out contains
         // the combinational M1 result being prepared for M2; using it here
         // let the EX multiplier/DCache/TLB path leak back into issue/popCount.
         val pipe = m1Reg.lane(lane).pipe
         Producer(m1Reg.valid(lane), pipe.regWriteEn && !pipe.hasException,
+            pipe.destReg, pipe.ex_result, !pipe.resFromMem && !pipe.isCsr)
+    }
+    val m1bProducers = (1 to 0 by -1).map { lane =>
+        val pipe = m1Out.lane(lane).pipe
+        Producer(m1bReg.valid(lane), pipe.regWriteEn && !pipe.hasException,
             pipe.destReg, pipe.ex_result, !pipe.resFromMem && !pipe.isCsr)
     }
     val m2Producers = (1 to 0 by -1).map { lane =>
@@ -710,7 +874,7 @@ class DualBackend extends Module {
             wbReg.lane(lane).pipe.destReg, wbFinalData(lane), true.B)
     }
     val producers = issueQueueProducers ++ exProducers ++
-        m1Producers ++ m2Producers ++ wbProducers
+        m1aProducers ++ m1bProducers ++ m2Producers ++ wbProducers
 
     def resolveSource(addr: UInt, read: Bool, rfData: UInt): (UInt, Bool) = {
         var selected: Bool = false.B
@@ -760,6 +924,9 @@ class DualBackend extends Module {
         issuedBlocked(port) := blocked(port) && issue.io.issueValid(port / 2)
     }
     val issueHazard = issuedBlocked.asUInt.orR
+    val idleHeadWaiting = io.fetchValid(0) &&
+        io.fetchBits(0).inst === "h06488000".U &&
+        !decodedPipe(0).pipe.hasException && !csr.io.hasInt
     val serialHead = io.fetchValid(0) && decodedPipe(0).serializing
     val issueQueueSerial = (0 until 2).map { entry =>
         issueQueueCount > entry.U && ((issueQueue(entry).valid(0) &&
@@ -767,15 +934,18 @@ class DualBackend extends Module {
             (issueQueue(entry).valid(1) &&
             issueQueue(entry).lane(1).serializing))
     }.reduce(_ || _)
-    val pipeSerialInFlight = Seq(exReg, m1Reg, m2Reg, wbReg).map { packet =>
+    val pipeSerialInFlight = Seq(exReg, m1Reg, m1bReg, m2Reg, wbReg).map { packet =>
         (packet.valid(0) && packet.lane(0).serializing) ||
         (packet.valid(1) && packet.lane(1).serializing)
     }.reduce(_ || _)
     val serialInFlight = issueQueueSerial || pipeSerialInFlight
     val serialBlocked = serialInFlight || (serialHead &&
-        (issueQueueCount =/= 0.U || exValid || m1Valid || m2Valid || wbValid))
+        (issueQueueCount =/= 0.U || exValid || m1Valid || m1bValid ||
+            m2Valid || wbValid))
     val issueCanEnqueue = issueQueueCount =/= 2.U
     val issueFire = issueCanEnqueue && !issueHazard && !serialBlocked &&
+        !idleHeadWaiting &&
+        !exLateFault && !m1LateFault &&
         !frontendFlushReg && issue.io.issueCount =/= 0.U
     io.popCount := Mux(issueFire, issue.io.issueCount, 0.U)
     io.issueBlockMask := issue.io.blockMask
@@ -790,10 +960,10 @@ class DualBackend extends Module {
     // Stage register updates.  Retiring flush has global priority; a branch
     // redirect removes only instructions younger than the EX branch.
     // ---------------------------------------------------------------------
-    val m1Fire = m1Valid && m1ReadyGo && m2AllowIn
     val issueDeq = issueQueueCount =/= 0.U && exAllowIn &&
-        !frontendFlushReg
-    io.icacheInvalidateAll := m1Fire && (0 until 2).map { lane =>
+        !frontendFlushReg && !pipeSerialInFlight &&
+        !exLateFault && !m1LateFault
+    io.icacheInvalidateAll := m1bFire && (0 until 2).map { lane =>
         m1IcacheCacop(lane) && !m1MmuFault(lane)
     }.reduce(_ || _)
 
@@ -829,6 +999,7 @@ class DualBackend extends Module {
     when(wbFlush) {
         wbReg := emptyPacket
         m2Reg := emptyPacket
+        m1bReg := emptyPacket
         m1Reg := emptyPacket
         exReg := emptyPacket
         divStarted := false.B
@@ -838,16 +1009,33 @@ class DualBackend extends Module {
         wbReg := Mux(m2Valid && m2ReadyGo, m2Out, emptyPacket)
 
         when(m2AllowIn) {
-            m2Reg := Mux(m1Fire, m1Out, emptyPacket)
+            m2Reg := Mux(m1bFire, m1Out, emptyPacket)
         }.otherwise {
             // Preserve a response from either bank while the other lane is
             // still waiting.
             m2Reg := m2Out
         }
-        when(m1AllowIn) {
+        when(m1bAllowIn) {
+            m1bReg := Mux(m1Fire, m1Reg, emptyPacket)
+            for (lane <- 0 until 2) {
+                m1bTlbFound(lane) := Mux(m1Fire, io.tlbFound(lane), false.B)
+                m1bTlbIndex(lane) := Mux(m1Fire, io.tlbIndex(lane), 0.U)
+                m1bTlbPpn(lane) := Mux(m1Fire, io.tlbPpn(lane), 0.U)
+                m1bTlbPs(lane) := Mux(m1Fire, io.tlbPs(lane), 0.U)
+                m1bTlbPlv(lane) := Mux(m1Fire, io.tlbPlv(lane), 0.U)
+                m1bTlbMat(lane) := Mux(m1Fire, io.tlbMat(lane), 0.U)
+                m1bTlbD(lane) := Mux(m1Fire, io.tlbD(lane), false.B)
+                m1bTlbV(lane) := Mux(m1Fire, io.tlbV(lane), false.B)
+            }
+        }
+        when(m1LateFault) {
+            m1Reg := emptyPacket
+        }.elsewhen(m1AllowIn) {
             m1Reg := Mux(exFire, exOut, emptyPacket)
         }
-        when(branchRedirect) {
+        when(m1LateFault) {
+            exReg := emptyPacket
+        }.elsewhen(branchRedirect) {
             exReg := emptyPacket
         }.elsewhen(exAllowIn) {
             exReg := Mux(issueDeq, issueQueue(0), emptyPacket)
@@ -869,7 +1057,7 @@ class DualBackend extends Module {
     // Lockstep invariants are part of the architectural contract: lane 1
     // cannot exist without its older lane 0.  Dual memory packets must target
     // different cache banks; same-bank pairs are serialized by issue.
-    for (packet <- Seq(exReg, m1Reg, m2Reg, wbReg)) {
+    for (packet <- Seq(exReg, m1Reg, m1bReg, m2Reg, wbReg)) {
         assert(!packet.valid(1) || packet.valid(0),
             "dual packet lane1 must never overtake lane0")
         val mem0 = packet.valid(0) &&

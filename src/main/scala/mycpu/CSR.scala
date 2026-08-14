@@ -16,6 +16,9 @@ object CsrAddr {
     val TLBELO0     = "h12".U(14.W)
     val TLBELO1     = "h13".U(14.W)
     val ASID        = "h18".U(14.W)
+    val PGDL        = "h19".U(14.W)
+    val PGDH        = "h1a".U(14.W)
+    val PGD         = "h1b".U(14.W)
     val SAVE0       = "h30".U(14.W)
     val SAVE1       = "h31".U(14.W)
     val SAVE2       = "h32".U(14.W)
@@ -39,10 +42,17 @@ object ExcCode {
     val PPI  = "h07".U(6.W) //Page Privilege Violation
     val ADEF = "h08".U(6.W) //Address Error (Fetch)         In IF
     val ALE  = "h09".U(6.W) //Address Alignment Error       In MEM
+    val IPE  = "h0E".U(6.W) //Instruction Privilege Error
     val TLBR = "h3F".U(6.W) //TLB Refill                    TLB doesn't have this entry
 
     def isMmuOrAlign(code: UInt): Bool = {
         val codes = Seq(PIL, PIS, PIF, PME, PPI, ADEF, ALE, TLBR)
+        codes.map(_ === code).reduce(_ || _)
+    }
+
+    /** Exceptions that architecturally provide a VPPN to the TLB handler. */
+    def writesTlbehi(code: UInt): Bool = {
+        val codes = Seq(PIL, PIS, PIF, PME, PPI, TLBR)
         codes.map(_ === code).reduce(_ || _)
     }
 }
@@ -93,8 +103,8 @@ class TlbidxReg extends Bundle {
     val ne          = UInt(1.W)  //31       No Entry    1: TLB missed, 0: TLB hit
     val padding     = UInt(1.W)  //30       Reserved
     val ps          = UInt(6.W)  //29:24    Page size   12: 4KB, 21: 2MB
-    val padding2    = UInt(20.W) //23:4     Reserved
-    val index       = UInt(4.W)  //3:0      TLB index
+    val padding2    = UInt(19.W) //23:5     Reserved
+    val index       = UInt(5.W)  //4:0      TLB index (32 entries)
 }
 
 //TLB Entry High
@@ -105,7 +115,8 @@ class TlbehiReg extends Bundle {
 
 //TLB Entry Low (We have two)
 class TlbeloReg extends Bundle {
-    val ppn         = UInt(24.W)  //31:8    Physical Page Number
+    val paddingTop  = UInt(4.W)   //31:28   Reserved for PALEN=32
+    val ppn         = UInt(20.W)  //27:8    Physical Page Number
     val padding     = UInt(1.W)   //7       Reserved
     val g           = UInt(1.W)   //6       Global, if 1 disable ASID matching
     val mat         = UInt(2.W)   //5:4     Memory Access Type  00: uncached, 01: cached
@@ -145,6 +156,8 @@ class TcfgReg extends Bundle {
 
 
 class CSR extends Module {
+    override def desiredName: String = "MyCpuCSR"
+
     val io = IO(new Bundle {
         val addr        = Input(UInt(14.W))
         val readData    = Output(UInt(32.W))
@@ -156,6 +169,7 @@ class CSR extends Module {
         val eentryOut   = Output(UInt(32.W))
         val eraOut      = Output(UInt(32.W))
         val hasInt      = Output(Bool())
+        val interruptPending = Output(UInt(32.W))
         
         val excValid    = Input(Bool())
         val excEcode    = Input(UInt(6.W))
@@ -171,7 +185,7 @@ class CSR extends Module {
         val tlbrd_we     = Input(Bool())
         val tlbrd_in     = Input(new TlbEntry())
         val tlb_out      = Output(new TlbEntry())
-        val tlbidx_out   = Output(UInt(4.W))
+        val tlbidx_out   = Output(UInt(5.W))
         val tlbrentryOut = Output(UInt(32.W))
 
         val llbitSet   = Input(Bool())
@@ -212,6 +226,10 @@ class CSR extends Module {
     val eraReg      = RegInit(0.U(32.W))
     //Bad Virtual Address
     val badvReg     = RegInit(0.U(32.W))
+    // LA32 page-directory bases.  PGD itself is a read-only selector: BADV's
+    // high bit chooses PGDH for the upper half and PGDL for the lower half.
+    val pgdlBase    = RegInit(0.U(20.W))    //31:12
+    val pgdhBase    = RegInit(0.U(20.W))    //31:12
     //Exception Entry
     val eentry_va   = RegInit(0.U(26.W))    //31:6
     //Save Registers
@@ -243,6 +261,199 @@ class CSR extends Module {
     estat_wire.is_hw    := io.hw_int_in
     estat_wire.is_sw    := estat_is_sw
     io.hasInt := ((ecfg.asUInt & estat_wire.asUInt) =/= 0.U) && (crmd.ie === 1.U)
+    io.interruptPending := ecfg.asUInt & estat_wire.asUInt
+
+    // Chiplab samples CSR state on the same positive edge as the commit
+    // packet.  Build a post-retirement view here; directly exporting the
+    // registers would expose their pre-write values to DPI for one cycle.
+    val dtCrmd = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.CRMD,
+        maskedWrite(crmd.asUInt, io.writeData, io.writeMask), crmd.asUInt).asTypeOf(new CrmdReg()))
+    val dtPrmd = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.PRMD,
+        maskedWrite(prmd.asUInt, io.writeData, io.writeMask), prmd.asUInt).asTypeOf(new PrmdReg()))
+    val dtEcfg = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.ECFG,
+        maskedWrite(ecfg.asUInt, io.writeData, io.writeMask), ecfg.asUInt).asTypeOf(new EcfgReg()))
+    val dtEstatSw = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.ESTAT,
+        maskedWrite(estat_is_sw, io.writeData(1, 0), io.writeMask(1, 0)), estat_is_sw))
+    val dtEstatTimer = WireDefault(estat_is_timer)
+    val dtEstatEcode = WireDefault(estat_ecode)
+    val dtEstatEsubcode = WireDefault(estat_esubcode)
+    val dtTlbidx = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TLBIDX,
+        maskedWrite(tlbidx.asUInt, io.writeData, io.writeMask), tlbidx.asUInt).asTypeOf(new TlbidxReg()))
+    val dtTlbehi = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TLBEHI,
+        maskedWrite(tlbehi.asUInt, io.writeData, io.writeMask), tlbehi.asUInt).asTypeOf(new TlbehiReg()))
+    val dtTlbelo0 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TLBELO0,
+        maskedWrite(tlbelo0.asUInt, io.writeData, io.writeMask), tlbelo0.asUInt).asTypeOf(new TlbeloReg()))
+    val dtTlbelo1 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TLBELO1,
+        maskedWrite(tlbelo1.asUInt, io.writeData, io.writeMask), tlbelo1.asUInt).asTypeOf(new TlbeloReg()))
+    val dtAsid = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.ASID,
+        maskedWrite(asid.asUInt, io.writeData, io.writeMask), asid.asUInt).asTypeOf(new AsidReg()))
+    val dtEra = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.ERA,
+        maskedWrite(eraReg, io.writeData, io.writeMask), eraReg))
+    val dtBadv = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.BADV,
+        maskedWrite(badvReg, io.writeData, io.writeMask), badvReg))
+    val dtPgdl = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.PGDL,
+        maskedWrite(pgdlBase, io.writeData(31, 12), io.writeMask(31, 12)), pgdlBase))
+    val dtPgdh = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.PGDH,
+        maskedWrite(pgdhBase, io.writeData(31, 12), io.writeMask(31, 12)), pgdhBase))
+    val dtEentry = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.EENTRY,
+        maskedWrite(eentry_va, io.writeData(31, 6), io.writeMask(31, 6)), eentry_va))
+    val dtSave0 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.SAVE0,
+        maskedWrite(save0Reg, io.writeData, io.writeMask), save0Reg))
+    val dtSave1 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.SAVE1,
+        maskedWrite(save1Reg, io.writeData, io.writeMask), save1Reg))
+    val dtSave2 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.SAVE2,
+        maskedWrite(save2Reg, io.writeData, io.writeMask), save2Reg))
+    val dtSave3 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.SAVE3,
+        maskedWrite(save3Reg, io.writeData, io.writeMask), save3Reg))
+    val dtTid = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TID,
+        maskedWrite(tidReg, io.writeData, io.writeMask), tidReg))
+    val dtTcfg = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TCFG,
+        maskedWrite(tcfg.asUInt, io.writeData, io.writeMask), tcfg.asUInt).asTypeOf(new TcfgReg()))
+    val dtTimerCnt = WireDefault(timer_cnt)
+    val dtTlbrentry = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.TLBRENTRY,
+        maskedWrite(tlbrentry_va, io.writeData(31, 6), io.writeMask(31, 6)), tlbrentry_va))
+    val dtDmw0 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.DMW0,
+        maskedWrite(dmw0.asUInt, io.writeData, io.writeMask), dmw0.asUInt).asTypeOf(new DmwReg()))
+    val dtDmw1 = WireDefault(Mux(io.writeEn && io.addr === CsrAddr.DMW1,
+        maskedWrite(dmw1.asUInt, io.writeData, io.writeMask), dmw1.asUInt).asTypeOf(new DmwReg()))
+    val dtLlbit = WireDefault(llbit)
+    val dtLlbKlo = WireDefault(llbKlo)
+
+    when(io.writeEn && io.addr === CsrAddr.TICLR && io.writeMask(0) && io.writeData(0)) {
+        dtEstatTimer := 0.U
+    }
+    when(io.writeEn && io.addr === CsrAddr.LLBCTL) {
+        when(io.writeMask(2)) { dtLlbKlo := io.writeData(2) }
+        when(io.writeMask(1) && io.writeData(1)) { dtLlbit := false.B }
+    }
+
+    when(io.writeEn && io.addr === CsrAddr.TCFG) {
+        // A TCFG write has priority over counting with the old enable bit.
+        // This core uses all ones as the stopped one-shot value, so disabling
+        // the timer must enter that state instead of consuming one more tick.
+        dtTimerCnt := Mux(dtTcfg.en === 1.U,
+            Cat(dtTcfg.initval, 0.U(2.W)), "hffffffff".U)
+    }.elsewhen(tcfg.en === 1.U && timer_cnt =/= "hffffffff".U) {
+        when(timer_cnt === 0.U) {
+            dtEstatTimer := 1.U
+            dtTimerCnt := Mux(tcfg.periodic === 1.U,
+                Cat(tcfg.initval, 0.U(2.W)), "hffffffff".U)
+        }.otherwise {
+            dtTimerCnt := timer_cnt - 1.U
+        }
+    }
+
+    when(io.excValid) {
+        dtPrmd.pplv := crmd.plv
+        dtPrmd.pie := crmd.ie
+        dtCrmd.plv := 0.U
+        dtCrmd.ie := 0.U
+        when(io.excEcode === ExcCode.TLBR) {
+            dtCrmd.da := 1.U
+            dtCrmd.pg := 0.U
+        }
+        dtEra := io.excPc
+        dtEstatEcode := io.excEcode
+        dtEstatEsubcode := io.excEsubcode
+        when(ExcCode.isMmuOrAlign(io.excEcode)) {
+            dtBadv := io.excAddr
+        }
+        when(ExcCode.writesTlbehi(io.excEcode)) {
+            dtTlbehi.vppn := io.excAddr(31, 13)
+        }
+    }.elsewhen(io.ertnFlush) {
+        dtCrmd.plv := prmd.pplv
+        dtCrmd.ie := prmd.pie
+        when(estat_ecode === ExcCode.TLBR) {
+            dtCrmd.da := 0.U
+            dtCrmd.pg := 1.U
+        }
+        when(!llbKlo) { dtLlbit := false.B }
+        dtLlbKlo := false.B
+    }
+    when(io.llbitSet) {
+        dtLlbit := true.B
+    }.elsewhen(io.llbitClear) {
+        dtLlbit := false.B
+    }
+
+    // TLBRD is architecturally visible at retirement and has the same final
+    // priority as the register updates below.
+    when(io.tlbrd_we) {
+        dtTlbidx.ne := !io.tlbrd_in.e
+        when(io.tlbrd_in.e) {
+            dtTlbidx.ps := Mux(io.tlbrd_in.ps4MB, 21.U, 12.U)
+            dtTlbehi.vppn := io.tlbrd_in.vppn
+            dtAsid.asid := io.tlbrd_in.asid
+            dtTlbelo0 := io.tlbrd_in.lo0
+            dtTlbelo1 := io.tlbrd_in.lo1
+        }.otherwise {
+            dtTlbidx.ps := 0.U
+            dtTlbehi.vppn := 0.U
+            dtAsid.asid := 0.U
+            dtTlbelo0 := 0.U.asTypeOf(new TlbeloReg())
+            dtTlbelo1 := 0.U.asTypeOf(new TlbeloReg())
+        }
+    }
+
+    dtCrmd.padding := 0.U
+    dtPrmd.padding := 0.U
+    dtEcfg.padding1 := 0.U
+    dtEcfg.padding2 := 0.U
+    dtTlbidx.padding := 0.U
+    dtTlbidx.padding2 := 0.U
+    dtTlbehi.padding := 0.U
+    dtTlbelo0.paddingTop := 0.U
+    dtTlbelo0.padding := 0.U
+    dtTlbelo1.paddingTop := 0.U
+    dtTlbelo1.padding := 0.U
+    dtAsid.padding1 := 0.U
+    dtAsid.padding2 := 0.U
+    dtAsid.asidbits := 10.U
+    dtDmw0.padding1 := 0.U
+    dtDmw0.padding2 := 0.U
+    dtDmw0.padding3 := 0.U
+    dtDmw1.padding1 := 0.U
+    dtDmw1.padding2 := 0.U
+    dtDmw1.padding3 := 0.U
+
+    val dtEstat = WireDefault(estat_wire)
+    dtEstat.is_sw := dtEstatSw
+    dtEstat.is_timer := dtEstatTimer
+    dtEstat.ecode := dtEstatEcode
+    dtEstat.esubcode := dtEstatEsubcode
+
+    // The adapter instantiates the real DPI module only with DIFFTEST_EN.
+    val difftestCsr = Module(new DifftestCSRRegStateSim())
+    difftestCsr.clock := clock
+    difftestCsr.coreid := 0.U
+    difftestCsr.crmd := dtCrmd.asUInt.pad(64)
+    difftestCsr.prmd := dtPrmd.asUInt.pad(64)
+    difftestCsr.euen := 0.U
+    difftestCsr.ecfg := dtEcfg.asUInt.pad(64)
+    difftestCsr.estat := dtEstat.asUInt.pad(64)
+    difftestCsr.era := dtEra.pad(64)
+    difftestCsr.badv := dtBadv.pad(64)
+    difftestCsr.eentry := Cat(dtEentry, 0.U(6.W)).pad(64)
+    difftestCsr.tlbidx := dtTlbidx.asUInt.pad(64)
+    difftestCsr.tlbehi := dtTlbehi.asUInt.pad(64)
+    difftestCsr.tlbelo0 := dtTlbelo0.asUInt.pad(64)
+    difftestCsr.tlbelo1 := dtTlbelo1.asUInt.pad(64)
+    difftestCsr.asid := dtAsid.asUInt.pad(64)
+    difftestCsr.pgdl := Cat(dtPgdl, 0.U(12.W)).pad(64)
+    difftestCsr.pgdh := Cat(dtPgdh, 0.U(12.W)).pad(64)
+    difftestCsr.save0 := dtSave0.pad(64)
+    difftestCsr.save1 := dtSave1.pad(64)
+    difftestCsr.save2 := dtSave2.pad(64)
+    difftestCsr.save3 := dtSave3.pad(64)
+    difftestCsr.tid := dtTid.pad(64)
+    difftestCsr.tcfg := dtTcfg.asUInt.pad(64)
+    difftestCsr.tval := dtTimerCnt.pad(64)
+    difftestCsr.ticlr := 0.U
+    difftestCsr.llbctl := Cat(0.U(29.W), dtLlbKlo, 0.U(1.W), dtLlbit).pad(64)
+    difftestCsr.tlbrentry := Cat(dtTlbrentry, 0.U(6.W)).pad(64)
+    difftestCsr.dmw0 := dtDmw0.asUInt.pad(64)
+    difftestCsr.dmw1 := dtDmw1.asUInt.pad(64)
 
 
     ////////////////////////////////////////////////////////////////////////
@@ -264,6 +475,8 @@ class CSR extends Module {
             is(CsrAddr.TLBELO0) { tlbelo0       := maskedWrite(tlbelo0.asUInt,  io.writeData, io.writeMask).asTypeOf(new TlbeloReg()) }
             is(CsrAddr.TLBELO1) { tlbelo1       := maskedWrite(tlbelo1.asUInt,  io.writeData, io.writeMask).asTypeOf(new TlbeloReg()) }
             is(CsrAddr.ASID)    { asid          := maskedWrite(asid.asUInt,     io.writeData, io.writeMask).asTypeOf(new AsidReg()) }
+            is(CsrAddr.PGDL)    { pgdlBase      := maskedWrite(pgdlBase,        io.writeData(31, 12), io.writeMask(31, 12)) }
+            is(CsrAddr.PGDH)    { pgdhBase      := maskedWrite(pgdhBase,        io.writeData(31, 12), io.writeMask(31, 12)) }
 
             is(CsrAddr.SAVE0)   { save0Reg      := maskedWrite(save0Reg,        io.writeData, io.writeMask) }
             is(CsrAddr.SAVE1)   { save1Reg      := maskedWrite(save1Reg,        io.writeData, io.writeMask) }
@@ -291,8 +504,9 @@ class CSR extends Module {
     ////////////////////////////////////////////////////////////////////////
     val tcfg_next_value = maskedWrite(tcfg.asUInt, io.writeData, io.writeMask).asTypeOf(new TcfgReg())
     val is_writing_tcfg = io.writeEn && (io.addr === CsrAddr.TCFG)
-    when(is_writing_tcfg && tcfg_next_value.en === 1.U) {
-        timer_cnt := Cat(tcfg_next_value.initval, 0.U(2.W))
+    when(is_writing_tcfg) {
+        timer_cnt := Mux(tcfg_next_value.en === 1.U,
+            Cat(tcfg_next_value.initval, 0.U(2.W)), "hffffffff".U)
     } .elsewhen(tcfg.en === 1.U && timer_cnt =/= "hffffffff".U) {
         when(timer_cnt === 0.U) {
             estat_is_timer := 1.U
@@ -321,6 +535,8 @@ class CSR extends Module {
 
         when(ExcCode.isMmuOrAlign(io.excEcode)) {
             badvReg     := io.excAddr
+        }
+        when(ExcCode.writesTlbehi(io.excEcode)) {
             tlbehi.vppn := io.excAddr(31, 13)
         }
     } .elsewhen(io.ertnFlush) {
@@ -359,6 +575,9 @@ class CSR extends Module {
         is(CsrAddr.TLBELO0) { io.readData := tlbelo0.asUInt }
         is(CsrAddr.TLBELO1) { io.readData := tlbelo1.asUInt }
         is(CsrAddr.ASID)    { io.readData := asid.asUInt }
+        is(CsrAddr.PGDL)    { io.readData := Cat(pgdlBase, 0.U(12.W)) }
+        is(CsrAddr.PGDH)    { io.readData := Cat(pgdhBase, 0.U(12.W)) }
+        is(CsrAddr.PGD)     { io.readData := Cat(Mux(badvReg(31), pgdhBase, pgdlBase), 0.U(12.W)) }
         is(CsrAddr.SAVE0)   { io.readData := save0Reg }
         is(CsrAddr.SAVE1)   { io.readData := save1Reg }
         is(CsrAddr.SAVE2)   { io.readData := save2Reg }
@@ -427,7 +646,9 @@ class CSR extends Module {
     tlbidx.padding  := 0.U
     tlbidx.padding2 := 0.U
     tlbehi.padding  := 0.U
+    tlbelo0.paddingTop := 0.U
     tlbelo0.padding := 0.U
+    tlbelo1.paddingTop := 0.U
     tlbelo1.padding := 0.U
     
     asid.padding1   := 0.U
