@@ -15,6 +15,9 @@ class CacheToCpuIO extends Bundle {
     val offset = Input(UInt(4.W))
     val wstrb  = Input(UInt(4.W))
     val wdata  = Input(UInt(32.W))
+    // AXI transfer size for uncached accesses: 0/1/2 = byte/halfword/word.
+    // Cached accesses always refill or write back a complete 16-byte line.
+    val access_size = Input(UInt(2.W))
 
     val addr_ok = Output(Bool())
     val data_ok = Output(Bool())
@@ -42,6 +45,9 @@ class CacheToAxiIO extends Bundle {
     val wr_wstrb  = Output(UInt(4.W))
     val wr_data   = Output(UInt(128.W))// 写回时，一口气吐出 128 位
     val wr_rdy    = Input(Bool())
+    // Pulses when the accepted AXI write receives its B response. Cache-line
+    // writeback and uncached stores are not externally visible before this.
+    val wr_done   = Input(Bool())
 }
 
 class Cache extends Module {
@@ -122,6 +128,7 @@ class Cache extends Module {
     val req_offset = RegInit(0.U(4.W))
     val req_wstrb  = RegInit(0.U(4.W))
     val req_wdata  = RegInit(0.U(32.W))
+    val req_access_size = RegInit(2.U(2.W))
 
     // ★ 新增：CACOP 锁存器
     val req_cacop_en = RegInit(false.B)
@@ -206,6 +213,7 @@ class Cache extends Module {
         req_offset := io.cpu.offset
         req_wstrb  := io.cpu.wstrb
         req_wdata  := io.cpu.wdata
+        req_access_size := io.cpu.access_size
         req_uncached := io.cpu.uncached
 
         // ★ 新增：锁存 CACOP 信号
@@ -231,7 +239,16 @@ class Cache extends Module {
     // read channel is available.  Remember that acceptance by keeping the
     // request bit cleared; otherwise sReplace can wait forever for a second
     // wr_rdy pulse and repeatedly issue an unacknowledged refill read.
-    val writeback_done = !need_writeback || !axi_wr_req_reg
+    // wr_rdy only means that the bridge has room to capture the request. A
+    // CACOP writeback must not complete at that point: DMA may be started by
+    // the very next MMIO store, so wait until the AXI B response proves that
+    // the dirty line is visible beyond the CPU cache.
+    val write_accepted = RegInit(false.B)
+    // wr_done is only a one-cycle B-channel pulse.  Latch it until sReplace
+    // can either launch the refill read or retire the CACOP/uncached store;
+    // the bridge intentionally blocks AR during the B handshake cycle.
+    val write_completed = RegInit(false.B)
+    val writeback_done = !need_writeback || write_completed
     // ★ 新增：CACOP 的完成条件
     // 修改前：(req_cacop_op === 0.U || req_cacop_op === 1.U)
     // 修改后：
@@ -240,11 +257,16 @@ class Cache extends Module {
         (req_cacop_op === 1.U && !index_needs_wb)
     )
     val cacop_hit_inval_done = (main_state === sLookup) && req_cacop_en && (req_cacop_op === 2.U) && !hit_dirty
-    val cacop_writeback_done = (main_state === sReplace) && req_cacop_en && (axi_wr_req_reg && io.axi.wr_rdy)
+    val cacop_writeback_done = (main_state === sReplace) && req_cacop_en &&
+        write_completed
+    val uncached_store_done = (main_state === sReplace) &&
+        is_normal_uncached && req_op && write_completed
+    val cached_store_refill_done = (main_state === sRefill) &&
+        io.axi.ret_valid && io.axi.ret_last && req_op && !req_uncached
 
     io.cpu.data_ok := (main_state === sLookup && cache_hit && !req_cacop_en) ||
-                      (main_state === sLookup && req_op === true.B && !req_cacop_en) ||
-                      refill_bypass_match ||
+                      refill_bypass_match || cached_store_refill_done ||
+                      uncached_store_done ||
                       cacop_index_done || cacop_hit_inval_done || cacop_writeback_done
 
 
@@ -379,7 +401,7 @@ class Cache extends Module {
     //Require missed cache data in Replace state
 
     io.axi.rd_req  := (main_state === sReplace) && writeback_done && need_read && !req_cacop_en
-    io.axi.rd_type := Mux(req_uncached, 2.U, 4.U)
+    io.axi.rd_type := Mux(req_uncached, req_access_size, 4.U)
     io.axi.rd_addr := Cat(req_tag, req_index, Mux(req_uncached, req_offset, 0.U(4.W)))
 
 
@@ -389,8 +411,20 @@ class Cache extends Module {
     } .elsewhen(axi_wr_req_reg && io.axi.wr_rdy) {
         axi_wr_req_reg := false.B
     }
+    when(miss_to_replace && need_writeback) {
+        write_accepted := false.B
+    } .elsewhen(axi_wr_req_reg && io.axi.wr_rdy) {
+        write_accepted := true.B
+    } .elsewhen(write_accepted && io.axi.wr_done) {
+        write_accepted := false.B
+    }
+    when(miss_to_replace && need_writeback) {
+        write_completed := false.B
+    } .elsewhen(write_accepted && io.axi.wr_done) {
+        write_completed := true.B
+    }
     io.axi.wr_req  := axi_wr_req_reg    //It will be activated in Replace state, actually
-    io.axi.wr_type := Mux(is_normal_uncached, 2.U, 4.U)
+    io.axi.wr_type := Mux(is_normal_uncached, req_access_size, 4.U)
 
     //Send old victim cache line data to AXI
     val replace_tag = miss_victim_tag

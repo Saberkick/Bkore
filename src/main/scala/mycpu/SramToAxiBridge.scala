@@ -15,9 +15,9 @@ class SramToAxiBridge extends Module {
 
     // 桥的并发边界要区分清楚：
     // 1) AR 状态机在 ICache/DCache 之间仲裁，全局最多一个未完成读 burst；DCache 优先。
-    // 2) AW/W 有独立的单项写缓冲，所以“一个读 + 一个缓存行写回”理论上可以并行，
-    //    并非所有 AXI 五通道共享一个全局 busy。
-    // 3) 非缓存写使用 write_pending 强序化，必须等 B 响应后才接受新的读写。
+    // 2) AW/W 有独立的单项写缓冲；当前实现保守地将所有写与后续读写串行化，
+    //    以便用一个 outstanding 标志精确跟踪 B 响应和 DMA 可见性。
+    // 3) 写请求使用 write_pending 强序化，必须等 B 响应后才接受新的读写。
     // 流水线侧仍是阻塞式：DCache/MEM 一次只维护一条数据访存指令。
 
     // 提取有效的读写请求
@@ -34,11 +34,14 @@ class SramToAxiBridge extends Module {
     // =========================================================================
     val write_pending = RegInit(false.B)
 
-    // 只有非缓存写（单拍 4 字节，wr_type === 2.U）才触发严格的 bvalid 阻塞
-    val is_uncached_write = data_req_write && (io.data_cache.wr_type === 2.U)
+    // Every accepted write, including a four-beat cache-line writeback, stays
+    // pending until its B response.  The cache must not treat bridge capture
+    // (wr_rdy) as proof that memory or a DMA master can observe the data.
+    val accepting_write = (w_state === w_idle) && data_req_write &&
+        !write_pending
 
-    // 真正受理非缓存写请求的那一拍，挂起警戒牌
-    when(w_state === w_idle && is_uncached_write && !write_pending) {
+    // 真正受理写请求的那一拍，挂起警戒牌
+    when(accepting_write) {
         write_pending := true.B     
     } .elsewhen(io.axi.bvalid && io.axi.bready) {
         write_pending := false.B    // AXI 返回写成功确认，解除警戒
@@ -50,7 +53,7 @@ class SramToAxiBridge extends Module {
     // leaves a one-cycle hole in which AR and AW/W can start together.  The
     // Chiplab simulation RAM can then accept the AR address but lose its R
     // response, leaving the requesting cache permanently in Refill.
-    val safe_to_read  = !write_pending && !is_uncached_write
+    val safe_to_read  = !write_pending && !accepting_write
     val safe_to_write = !write_pending
 
     // =========================================================================
@@ -100,7 +103,9 @@ class SramToAxiBridge extends Module {
     // 在 AR 状态机赋值处：
     // 直接用锁存好的大小判断。4.U 代表 16 字节缓存行，需要 4 拍 (arlen=3)。否则单拍 (arlen=0)
     io.axi.arlen  := Mux(ar_size_reg === 4.U, 3.U, 0.U)
-    io.axi.arsize := 2.U // 无论突发还是单拍，每一拍的数据量永远是 4 字节 (3b'010)
+    // Internal type 4 means a 16-byte line: four 32-bit AXI beats.  Single
+    // uncached accesses retain their architectural byte/halfword/word size.
+    io.axi.arsize := Mux(ar_size_reg === 4.U, 2.U, ar_size_reg)
     io.axi.arburst := "b01".U  // INCR 模式
     io.axi.arlock  := 0.U      //
     io.axi.arcache := 0.U      //
@@ -121,6 +126,8 @@ class SramToAxiBridge extends Module {
     io.data_cache.ret_valid := io.axi.rvalid && (io.axi.rid === 1.U)
     io.data_cache.ret_last  := io.axi.rlast
     io.data_cache.ret_data  := io.axi.rdata
+    io.inst_cache.wr_done := false.B
+    io.data_cache.wr_done := io.axi.bvalid && io.axi.bready && write_pending
 
     // =========================================================================
     // 状态机 3：写请求 (AW) 与 写数据 (W) 通道
@@ -169,7 +176,7 @@ class SramToAxiBridge extends Module {
     io.axi.awvalid := (w_state === w_wait_all) || (w_state === w_wait_aw)
     io.axi.awid    := 1.U      // 写通道 ID 固定为 1
     io.axi.awaddr  := aw_addr_reg
-    io.axi.awsize  := 2.U
+    io.axi.awsize  := Mux(is_burst_write, 2.U, aw_size_reg)
     io.axi.awlen   := Mux(is_burst_write, 3.U, 0.U)
     io.axi.awburst := "b01".U  //
     io.axi.awlock  := 0.U      //
@@ -190,15 +197,7 @@ class SramToAxiBridge extends Module {
     // =========================================================================
     // 状态机 4：写响应通道 (B)
     // =========================================================================
-    val b_valid_buf = RegInit(false.B)
     io.axi.bready := true.B
-    
-    when(io.axi.bvalid && io.axi.bready) {
-        b_valid_buf := true.B
-    }
-    when(b_valid_buf) {
-        b_valid_buf := false.B
-    }
 
     // =========================================================================
     // 最终：把分离的 AXI 信号，“翻译”回控制信号，反馈给 CPU/Cache

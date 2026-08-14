@@ -13,6 +13,7 @@ class DCacheLaneIO extends Bundle {
     val addr = Input(UInt(32.W))
     val wstrb = Input(UInt(4.W))
     val wdata = Input(UInt(32.W))
+    val access_size = Input(UInt(2.W))
     val uncached = Input(Bool())
     val cacop_en = Input(Bool())
     val cacop_op = Input(UInt(2.W))
@@ -44,9 +45,13 @@ class DualBankDCache extends Module {
         val lane0Hits = io.cpu(0).request && laneBank(0) === bank.U
         val lane1Hits = io.cpu(1).request && laneBank(1) === bank.U
         val selectLane1 = !lane0Hits && lane1Hits
-        val selectedValid =
-            (io.cpu(0).valid && laneBank(0) === bank.U) ||
-            (io.cpu(1).valid && laneBank(1) === bank.U)
+        // A bank with no matching request must remain idle.  Selecting lane 0
+        // as the payload default is harmless, but selecting lane0.valid as the
+        // default is not: a lane-0-only access to bank 1 would otherwise also
+        // inject a phantom copy into bank 0.  That copy can outlive the real
+        // request and corrupt a later line fill/store sequence.
+        val selectedValid = (lane0Hits || lane1Hits) && Mux(selectLane1,
+            io.cpu(1).valid, io.cpu(0).valid)
 
         banks(bank).io.cpu.valid := selectedValid
         val selectedAddr = Mux(selectLane1, io.cpu(1).addr, io.cpu(0).addr)
@@ -58,6 +63,8 @@ class DualBankDCache extends Module {
             io.cpu(1).wstrb, io.cpu(0).wstrb)
         banks(bank).io.cpu.wdata := Mux(selectLane1,
             io.cpu(1).wdata, io.cpu(0).wdata)
+        banks(bank).io.cpu.access_size := Mux(selectLane1,
+            io.cpu(1).access_size, io.cpu(0).access_size)
         banks(bank).io.cpu.uncached := Mux(selectLane1,
             io.cpu(1).uncached, io.cpu(0).uncached)
         banks(bank).io.cpu.cacop_en := Mux(selectLane1,
@@ -116,14 +123,16 @@ class DualBankDCache extends Module {
         readActive := false.B
     }
 
-    // CacheToAxiIO acknowledges writes when the downstream bridge has copied
-    // the complete request, so write ownership does not need to survive beyond
-    // the wr_rdy handshake.
+    // Write ownership survives until the downstream AXI B response.  Cache
+    // completion is no longer the wr_rdy capture pulse: dirty eviction,
+    // CACOP writeback and uncached stores all wait for wr_done.
+    val writeActive = RegInit(false.B)
+    val writeOwner = RegInit(false.B)
     val writeRoundRobin = RegInit(false.B)
     val writeReq = VecInit(banks.map(_.io.axi.wr_req))
     val chooseWrite1 = Mux(writeReq.asUInt.andR, writeRoundRobin,
         !writeReq(0) && writeReq(1))
-    io.axi.wr_req := Mux(chooseWrite1,
+    io.axi.wr_req := !writeActive && Mux(chooseWrite1,
         banks(1).io.axi.wr_req, banks(0).io.axi.wr_req)
     io.axi.wr_type := Mux(chooseWrite1,
         banks(1).io.axi.wr_type, banks(0).io.axi.wr_type)
@@ -137,14 +146,40 @@ class DualBankDCache extends Module {
     // Cache uses wr_rdy once in sMiss as a permission to enter Replace, before
     // wr_req is asserted.  When no bank has a real request both may receive
     // that permission; once wr_req appears only the selected bank is accepted.
-    banks(0).io.axi.wr_rdy := io.axi.wr_rdy &&
+    banks(0).io.axi.wr_rdy := !writeActive && io.axi.wr_rdy &&
         (!anyWriteRequest || !chooseWrite1)
-    banks(1).io.axi.wr_rdy := io.axi.wr_rdy &&
+    banks(1).io.axi.wr_rdy := !writeActive && io.axi.wr_rdy &&
         (!anyWriteRequest || chooseWrite1)
-    when(io.axi.wr_req && io.axi.wr_rdy) {
+    banks(0).io.axi.wr_done := io.axi.wr_done && writeActive && !writeOwner
+    banks(1).io.axi.wr_done := io.axi.wr_done && writeActive && writeOwner
+
+    val writeAccept = io.axi.wr_req && io.axi.wr_rdy
+    when(writeAccept) {
+        writeActive := true.B
+        writeOwner := chooseWrite1
         writeRoundRobin := !chooseWrite1
+    }.elsewhen(io.axi.wr_done && writeActive) {
+        writeActive := false.B
     }
 
+    for (lane <- 0 until 2) {
+        assert(!io.cpu(lane).valid || io.cpu(lane).request,
+            "DCache lane valid requires a matching request identity")
+    }
+    for (bank <- 0 until 2) {
+        val bankHasRequest = (io.cpu(0).request && laneBank(0) === bank.U) ||
+            (io.cpu(1).request && laneBank(1) === bank.U)
+        assert(!banks(bank).io.cpu.valid || bankHasRequest,
+            "DCache bank valid requires a lane request for that bank")
+    }
     assert(!(io.cpu(0).request && io.cpu(1).request && laneBank(0) === laneBank(1)),
         "same-bank LSU requests must be serialized before DualBankDCache")
+    when(io.cpu(0).request && io.cpu(1).request) {
+        assert(io.cpu(0).valid === io.cpu(1).valid,
+            "dual-bank LSU requests must be accepted atomically")
+    }
+    assert(!(io.axi.wr_done && !writeActive),
+        "AXI write completion arrived without a bank owner")
+    assert(!(banks(0).io.axi.wr_done && banks(1).io.axi.wr_done),
+        "AXI write completion must target exactly one DCache bank")
 }
