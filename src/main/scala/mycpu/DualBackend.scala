@@ -832,7 +832,8 @@ class DualBackend extends Module {
     }
 
     case class Producer(
-        valid: Bool, write: Bool, dest: UInt, result: UInt, ready: Bool)
+        valid: Bool, write: Bool, dest: UInt, result: UInt, ready: Bool,
+        lateLoad: Bool = false.B)
 
     val issueQueueProducers = (1 to 0 by -1).flatMap { entry =>
         (1 to 0 by -1).map { lane =>
@@ -860,7 +861,8 @@ class DualBackend extends Module {
     val m1bProducers = (1 to 0 by -1).map { lane =>
         val pipe = m1Out.lane(lane).pipe
         Producer(m1bReg.valid(lane), pipe.regWriteEn && !pipe.hasException,
-            pipe.destReg, pipe.ex_result, !pipe.resFromMem && !pipe.isCsr)
+            pipe.destReg, pipe.ex_result, !pipe.resFromMem && !pipe.isCsr,
+            m1bFire && pipe.resFromMem)
     }
     val m2Producers = (1 to 0 by -1).map { lane =>
         val pipe = m2Out.lane(lane).pipe
@@ -876,23 +878,27 @@ class DualBackend extends Module {
     val producers = issueQueueProducers ++ exProducers ++
         m1aProducers ++ m1bProducers ++ m2Producers ++ wbProducers
 
-    def resolveSource(addr: UInt, read: Bool, rfData: UInt): (UInt, Bool) = {
+    def resolveSource(addr: UInt, read: Bool, rfData: UInt):
+            (UInt, Bool, Bool) = {
         var selected: Bool = false.B
         var value: UInt = rfData
         var blocked: Bool = false.B
+        var lateLoad: Bool = false.B
         for (producer <- producers) {
             val hit = read && addr =/= 0.U && producer.valid &&
                 producer.write && producer.dest === addr
             val take = hit && !selected
             value = Mux(take && producer.ready, producer.result, value)
-            blocked = blocked || (take && !producer.ready)
+            blocked = blocked || (take && !producer.ready && !producer.lateLoad)
+            lateLoad = lateLoad || (take && producer.lateLoad)
             selected = selected || hit
         }
-        (value, blocked)
+        (value, blocked, lateLoad)
     }
 
     val resolved = Wire(Vec(4, UInt(32.W)))
     val blocked = Wire(Vec(4, Bool()))
+    val lateLoad = Wire(Vec(4, Bool()))
     for (port <- 0 until 4) {
         val lane = port / 2
         val read = io.fetchValid(lane) &&
@@ -900,11 +906,21 @@ class DualBackend extends Module {
                    else decodedPipe(lane).src2Read)
         val pair = resolveSource(srcAddr(port), read, regfile.io.rdata(port))
         resolved(port) := pair._1
-        blocked(port) := pair._2
+        // Address generation, store data, CSR and MDU operations remain on
+        // the conservative path.  Their operand may affect issue pairing or
+        // a multi-cycle side effect before the late value is available.
+        val simpleConsumer = !decodedPipe(lane).pipe.resFromMem &&
+            !decodedPipe(lane).pipe.memWe && !decodedPipe(lane).pipe.is_cacop &&
+            !decodedPipe(lane).pipe.isCsr &&
+            !decodedPipe(lane).pipe.resFromMulDiv
+        lateLoad(port) := pair._3 && simpleConsumer
+        blocked(port) := pair._2 || (pair._3 && !simpleConsumer)
     }
     for (lane <- 0 until 2) {
         decodedPipe(lane).pipe.src1_value := resolved(2 * lane)
         decodedPipe(lane).pipe.src2_value := resolved(2 * lane + 1)
+        decodedPipe(lane).src1LateLoad := lateLoad(2 * lane)
+        decodedPipe(lane).src2LateLoad := lateLoad(2 * lane + 1)
 
         val effectiveLow = resolved(2 * lane)(4, 0) +
             decodedPipe(lane).pipe.imm(4, 0)
@@ -956,11 +972,64 @@ class DualBackend extends Module {
         issuePacket.lane(lane) := decodedPipe(lane)
     }
 
+    // Complete operands which entered the issue buffer one cycle ahead of an
+    // older load.  M2 holds a miss until data_ok, so an unresolved late source
+    // cannot lose its producer.  The updated payload is also written back to
+    // the buffer when EX is busy.
+    def forwardLateLoad(addr: UInt, pending: Bool, original: UInt):
+            (UInt, Bool) = {
+        var value: UInt = original
+        var matched: Bool = false.B
+        for (producerLane <- 1 to 0 by -1) {
+            val producer = m2Out.lane(producerLane).pipe
+            val ready = m2Reg.valid(producerLane) && producer.resFromMem &&
+                producer.regWriteEn && !producer.hasException &&
+                (m2Reg.lane(producerLane).dcacheDone ||
+                    io.dcache(producerLane).data_ok)
+            val take = pending && !matched && addr =/= 0.U && ready &&
+                producer.destReg === addr
+            value = Mux(take, producer.ex_result, value)
+            matched = matched || take
+        }
+        (value, pending && !matched)
+    }
+
+    val forwardedIssueQueue = WireDefault(issueQueue)
+    for (entry <- 0 until 2; lane <- 0 until 2) {
+        val laneData = issueQueue(entry).lane(lane)
+        val src1Forward = forwardLateLoad(laneData.pipe.src1_addr,
+            laneData.src1LateLoad, laneData.pipe.src1_value)
+        val src2Forward = forwardLateLoad(laneData.pipe.src2_addr,
+            laneData.src2LateLoad, laneData.pipe.src2_value)
+        forwardedIssueQueue(entry).lane(lane).pipe.src1_value := src1Forward._1
+        forwardedIssueQueue(entry).lane(lane).src1LateLoad := src1Forward._2
+        forwardedIssueQueue(entry).lane(lane).pipe.src2_value := src2Forward._1
+        forwardedIssueQueue(entry).lane(lane).src2LateLoad := src2Forward._2
+    }
+    val issueHeadLatePending = (0 until 2).map { lane =>
+        forwardedIssueQueue(0).valid(lane) &&
+        (forwardedIssueQueue(0).lane(lane).src1LateLoad ||
+         forwardedIssueQueue(0).lane(lane).src2LateLoad)
+    }.reduce(_ || _)
+    val issuePacketLatePending = (0 until 2).map { lane =>
+        issuePacket.valid(lane) &&
+        (issuePacket.lane(lane).src1LateLoad ||
+         issuePacket.lane(lane).src2LateLoad)
+    }.reduce(_ || _)
+
+    // The two-entry queue is a skid buffer, not a mandatory pipeline stage.
+    // When it is empty, a ready packet falls directly into EX.  Pending load
+    // operands still enter the queue so M2 can fill them before execution.
+    val issueBypass = issueFire && issueQueueCount === 0.U && exAllowIn &&
+        !issuePacketLatePending
+    val issueEnqueue = issueFire && !issueBypass
+
     // ---------------------------------------------------------------------
     // Stage register updates.  Retiring flush has global priority; a branch
     // redirect removes only instructions younger than the EX branch.
     // ---------------------------------------------------------------------
     val issueDeq = issueQueueCount =/= 0.U && exAllowIn &&
+        !issueHeadLatePending &&
         !frontendFlushReg && !pipeSerialInFlight &&
         !exLateFault && !m1LateFault
     io.icacheInvalidateAll := m1bFire && (0 until 2).map { lane =>
@@ -973,7 +1042,7 @@ class DualBackend extends Module {
     when(frontendFlushReg) {
         issueQueueCount := 0.U
     }.otherwise {
-        switch(Cat(issueFire, issueDeq)) {
+        switch(Cat(issueEnqueue, issueDeq)) {
             is("b10".U) {
                 issueQueueCount := issueQueueCount + 1.U
             }
@@ -986,14 +1055,17 @@ class DualBackend extends Module {
     // Payload bits need no explicit flush: count=0 invalidates both entries.
     // Keeping these writes outside the redirect-priority block prevents the
     // long branch/TLB/cache cone from becoming the CE of every payload FF.
-    when(issueFire) {
+    when(issueEnqueue) {
         when(issueDeq || issueQueueCount === 0.U) {
             issueQueue(0) := issuePacket
         }.otherwise {
+            issueQueue(0) := forwardedIssueQueue(0)
             issueQueue(1) := issuePacket
         }
     }.elsewhen(issueDeq && issueQueueCount === 2.U) {
-        issueQueue(0) := issueQueue(1)
+        issueQueue(0) := forwardedIssueQueue(1)
+    }.elsewhen(!issueDeq) {
+        issueQueue := forwardedIssueQueue
     }
 
     when(wbFlush) {
@@ -1038,7 +1110,8 @@ class DualBackend extends Module {
         }.elsewhen(branchRedirect) {
             exReg := emptyPacket
         }.elsewhen(exAllowIn) {
-            exReg := Mux(issueDeq, issueQueue(0), emptyPacket)
+            exReg := Mux(issueDeq, forwardedIssueQueue(0),
+                Mux(issueBypass, issuePacket, emptyPacket))
         }
 
         when(divider.io.enable && divider.io.ready) {
