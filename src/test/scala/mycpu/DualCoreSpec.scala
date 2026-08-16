@@ -241,6 +241,39 @@ class Regfile4R2WSpec extends AnyFlatSpec with ChiselSim {
     }
 }
 
+class MultiplierSpec extends AnyFlatSpec with ChiselSim {
+    behavior of "Multiplier"
+
+    it should "register the 33x33 product before selecting the result word" in {
+        NativeSimulatorGuard.requireAvailable()
+        simulate(new Multiplier()) { dut =>
+            dut.io.enable.poke(false.B)
+            dut.io.flush.poke(false.B)
+            dut.io.consume.poke(false.B)
+            dut.io.src1.poke("hffffffff".U)
+            dut.io.src2.poke(2.U)
+            dut.io.isSigned.poke(false.B)
+            dut.io.highWord.poke(true.B)
+            dut.io.done.expect(false.B)
+
+            dut.io.enable.poke(true.B)
+            dut.clock.step()
+            dut.io.enable.poke(false.B)
+            dut.io.done.expect(true.B)
+            dut.io.result.expect(1.U)
+
+            dut.clock.step(2)
+            dut.io.done.expect(true.B)
+            dut.io.result.expect(1.U)
+
+            dut.io.consume.poke(true.B)
+            dut.clock.step()
+            dut.io.consume.poke(false.B)
+            dut.io.done.expect(false.B)
+        }
+    }
+}
+
 class AtomicDecodeSpec extends AnyFlatSpec with ChiselSim {
     behavior of "LoongArch atomic decode"
 

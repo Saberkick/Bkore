@@ -60,6 +60,34 @@ class DualSmokeHarness extends Module {
         assert(issue.io.issueCount === 2.U)
     }
 
+    // The registered 33x33 product must remain stable until consumed.  These
+    // cases cover MUL.W plus the signed and unsigned high-word variants.
+    val multiplier = Module(new Multiplier())
+    multiplier.io.enable := cycle === 0.U || cycle === 2.U || cycle === 5.U
+    multiplier.io.flush := cycle === 8.U
+    multiplier.io.consume := cycle === 1.U || cycle === 3.U || cycle === 6.U
+    multiplier.io.src1 := Mux(cycle === 0.U, "hfffffff0".U,
+        Mux(cycle === 2.U, "hfffffffe".U, "hffffffff".U))
+    multiplier.io.src2 := Mux(cycle === 0.U, 36.U,
+        Mux(cycle === 2.U, 3.U, 2.U))
+    multiplier.io.isSigned := cycle =/= 5.U
+    multiplier.io.highWord := cycle =/= 0.U
+    when(cycle === 1.U) {
+        assert(multiplier.io.done)
+        assert(multiplier.io.result === "hfffffdc0".U)
+    }
+    when(cycle === 3.U) {
+        assert(multiplier.io.done)
+        assert(multiplier.io.result === "hffffffff".U)
+    }
+    when(cycle === 6.U) {
+        assert(multiplier.io.done)
+        assert(multiplier.io.result === 1.U)
+    }
+    when(cycle === 7.U || cycle === 9.U) {
+        assert(!multiplier.io.done)
+    }
+
     val predictor = Module(new DualBranchPredictor(clearSets = 4))
     predictor.io.reqValid := cycle === 6.U || cycle === 10.U || cycle === 14.U
     val predictorPc = Mux(cycle === 10.U, "h1c000008".U,

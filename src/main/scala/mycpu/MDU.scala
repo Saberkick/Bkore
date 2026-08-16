@@ -24,16 +24,48 @@ class div_gen_0 extends ExtModule {
         val m_axis_dout_tdata       = Output(UInt(64.W))
     })
 }
+/**
+  * One-request pipelined integer multiplier.
+  *
+  * The 33x33 product is captured on the first cycle.  High/low word
+  * selection is deliberately placed after that register, so the FPGA DSP
+  * cascade cannot extend through the EX result mux into the next stage.
+  * `done` remains asserted until the backend consumes the result, which also
+  * makes the unit safe when the whole EX packet is held by downstream
+  * backpressure.
+  */
 class Multiplier extends Module {
     val io = IO(new Bundle {
+        val enable   = Input(Bool())
+        val flush    = Input(Bool())
+        val consume  = Input(Bool())
         val src1     = Input(UInt(32.W))
         val src2     = Input(UInt(32.W))
         val isSigned = Input(Bool())
-        val result64 = Output(UInt(64.W))
+        val highWord = Input(Bool())
+        val result   = Output(UInt(32.W))
+        val done     = Output(Bool())
     })
-    val signedRes   = RegNext(io.src1.asSInt * io.src2.asSInt).asUInt
-    val unsignedRes = RegNext(io.src1 * io.src2)
-    io.result64    := Mux(io.isSigned, signedRes, unsignedRes)
+
+    val productValid = RegInit(false.B)
+    val productReg   = RegInit(0.U(66.W))
+    val highWordReg  = RegInit(false.B)
+
+    val operandA = Cat(io.isSigned && io.src1(31), io.src1).asSInt
+    val operandB = Cat(io.isSigned && io.src2(31), io.src2).asSInt
+
+    when(io.flush) {
+        productValid := false.B
+    }.elsewhen(io.enable && !productValid) {
+        productReg  := (operandA * operandB).asUInt
+        highWordReg := io.highWord
+        productValid := true.B
+    }.elsewhen(io.consume) {
+        productValid := false.B
+    }
+
+    io.result := Mux(highWordReg, productReg(63, 32), productReg(31, 0))
+    io.done := productValid
 }
 
 class Divider extends Module {

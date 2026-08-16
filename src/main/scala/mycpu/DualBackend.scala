@@ -318,17 +318,20 @@ class DualBackend extends Module {
          exReg.lane(0).pipe.mduOp === MduOp.DIV_WU ||
          exReg.lane(0).pipe.mduOp === MduOp.MOD_WU)
 
-    val mulSigned = exReg.lane(0).pipe.mduOp === MduOp.MULH_W
-    // A single sign-extended 33x33 multiply covers both signed and unsigned
-    // products.  The low 64 bits are identical to the corresponding 32x32
-    // result, avoiding two parallel multipliers and a result-wide mux.
-    val mulA = Cat(mulSigned && exReg.lane(0).pipe.src1_value(31),
-        exReg.lane(0).pipe.src1_value).asSInt
-    val mulB = Cat(mulSigned && exReg.lane(0).pipe.src2_value(31),
-        exReg.lane(0).pipe.src2_value).asSInt
-    val mulProduct = (mulA * mulB).asUInt
-    val liveMulResult = Mux(exReg.lane(0).pipe.mduOp === MduOp.MUL_W,
-        mulProduct(31, 0), mulProduct(63, 32))
+    // MUL and a younger simple ALU may share an EX packet.  Keep the packet
+    // resident until the registered 33x33 product is available.  This removes
+    // the DSP cascade from the EX-to-M1 path, so a paired simple ALU result no
+    // longer shares a stage boundary with an unregistered multiplication.
+    val multiplier = Module(new Multiplier())
+    val multiplierFlush = WireDefault(false.B)
+    val multiplierConsume = WireDefault(false.B)
+    multiplier.io.enable := exIsMul && !multiplier.io.done
+    multiplier.io.flush := multiplierFlush
+    multiplier.io.consume := multiplierConsume
+    multiplier.io.src1 := exReg.lane(0).pipe.src1_value
+    multiplier.io.src2 := exReg.lane(0).pipe.src2_value
+    multiplier.io.isSigned := exReg.lane(0).pipe.mduOp === MduOp.MULH_W
+    multiplier.io.highWord := exReg.lane(0).pipe.mduOp =/= MduOp.MUL_W
 
     val divider = Module(new Divider())
     val divStarted = RegInit(false.B)
@@ -353,12 +356,12 @@ class DualBackend extends Module {
     val liveDivResult = Mux(
         exReg.lane(0).pipe.mduOp === MduOp.DIV_W ||
         exReg.lane(0).pipe.mduOp === MduOp.DIV_WU, signedQ, signedR)
-    val currentMduResult = Mux(exIsMul, liveMulResult,
+    val currentMduResult = Mux(exIsMul, multiplier.io.result,
         Mux(divider.io.done, liveDivResult, divResult))
 
     val exReadyGo = !exValid ||
         (!exIsMul && !exIsDiv) ||
-        exIsMul ||
+        (exIsMul && multiplier.io.done) ||
         (exIsDiv && (divFinished || divider.io.done))
 
     val exForwardResult = Wire(Vec(2, UInt(32.W)))
@@ -670,6 +673,8 @@ class DualBackend extends Module {
     val m1AllowIn = !m1Valid || m1Fire
     val exAllowIn = !exValid || (exReadyGo && m1AllowIn)
     val exFire = exValid && exReadyGo && m1AllowIn && !m1LateFault
+    multiplierFlush := wbFlush || m1LateFault
+    multiplierConsume := exIsMul && exFire
 
     val lane0ArchitecturalBranchEvent = exReg.valid(0) &&
         (exReg.lane(0).pipe.brType =/= BrType.NOP ||
