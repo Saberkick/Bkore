@@ -25,14 +25,31 @@ class div_gen_0 extends ExtModule {
     })
 }
 /**
+  * Vivado Multiplier Generator v12.0 的纯黑盒声明。
+  *
+  * 一个 33x33 有符号并行乘法，配置 1 级流水（积寄存在 DSP 内部的 MREG/PREG），
+  * 因此 66 位积不再从 DSP 组合输出拉到 fabric FF。工程里必须另外加入名为
+  * mult_gen_0 的 XCI/output products；Verilator 用 src/test/resources 下的
+  * mult_gen_0_sim.sv 行为模型。具体配置见 MULTIPLIER_IP_VIVADO.md。
+  */
+class mult_gen_0 extends ExtModule {
+    val io = FlatIO(new Bundle {
+        val CLK = Input(Clock())
+        val A   = Input(UInt(33.W))
+        val B   = Input(UInt(33.W))
+        val P   = Output(UInt(66.W))
+    })
+}
+
+/**
   * One-request pipelined integer multiplier.
   *
-  * The 33x33 product is captured on the first cycle.  High/low word
-  * selection is deliberately placed after that register, so the FPGA DSP
-  * cascade cannot extend through the EX result mux into the next stage.
-  * `done` remains asserted until the backend consumes the result, which also
-  * makes the unit safe when the whole EX packet is held by downstream
-  * backpressure.
+  * The 33x33 signed product is captured by the IP's internal pipeline register
+  * (one cycle).  High/low word selection is placed after that register, so the
+  * FPGA DSP cascade cannot extend through the EX result mux into the next
+  * stage.  `done` remains asserted until the backend consumes the result,
+  * which also makes the unit safe when the whole EX packet is held by
+  * downstream backpressure.
   */
 class Multiplier extends Module {
     val io = IO(new Bundle {
@@ -47,24 +64,29 @@ class Multiplier extends Module {
         val done     = Output(Bool())
     })
 
-    val productValid = RegInit(false.B)
-    val productReg   = RegInit(0.U(66.W))
-    val highWordReg  = RegInit(false.B)
+    val mul = Module(new mult_gen_0())
+    mul.io.CLK := clock
+    // A sign-extension covers both signed and unsigned products: the low 64
+    // bits are identical to the corresponding 32x32 result.  The IP is always
+    // configured as a 33x33 signed multiplier.
+    mul.io.A := Cat(io.isSigned && io.src1(31), io.src1)
+    mul.io.B := Cat(io.isSigned && io.src2(31), io.src2)
 
-    val operandA = Cat(io.isSigned && io.src1(31), io.src1).asSInt
-    val operandB = Cat(io.isSigned && io.src2(31), io.src2).asSInt
+    // The product is registered inside the DSP, so only the one-bit validity
+    // and the high/low select remain in fabric.
+    val productValid = RegInit(false.B)
+    val highWordReg  = RegInit(false.B)
 
     when(io.flush) {
         productValid := false.B
     }.elsewhen(io.enable && !productValid) {
-        productReg  := (operandA * operandB).asUInt
         highWordReg := io.highWord
         productValid := true.B
     }.elsewhen(io.consume) {
         productValid := false.B
     }
 
-    io.result := Mux(highWordReg, productReg(63, 32), productReg(31, 0))
+    io.result := Mux(highWordReg, mul.io.P(63, 32), mul.io.P(31, 0))
     io.done := productValid
 }
 
