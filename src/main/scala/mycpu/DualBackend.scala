@@ -321,6 +321,9 @@ class DualBackend extends Module {
          exReg.lane(0).pipe.mduOp === MduOp.MOD_W ||
          exReg.lane(0).pipe.mduOp === MduOp.DIV_WU ||
          exReg.lane(0).pipe.mduOp === MduOp.MOD_WU)
+    // RRWINZ 被标记为串行指令，因此进入 EX 时一定占据较老的 lane0。
+    val exIsRrwinz = exReg.valid(0) && !exReg.lane(0).pipe.hasException &&
+        exReg.lane(0).pipe.isRrwinz
 
     // MUL and a younger simple ALU may share an EX packet.  Keep the packet
     // resident until the registered 33x33 product is available.  This removes
@@ -363,10 +366,27 @@ class DualBackend extends Module {
     val currentMduResult = Mux(exIsMul, multiplier.io.result,
         Mux(divider.io.done, liveDivResult, divResult))
 
+    // 使用独立的多周期单元，避免可变 popcount/rotate 网络进入普通 ALU 关键路径。
+    val rrwinz = Module(new RrwinzUnit())
+    val rrwinzConsume = WireDefault(false.B)
+    val rrwinzFlush = WireDefault(false.B)
+    // EX 保持该指令期间 enable 可持续为高；单元只在 Idle 状态锁存一次请求。
+    rrwinz.io.enable := exIsRrwinz
+    // 精确异常或更老指令重定向时，清除尚未退休的自定义指令状态。
+    rrwinz.io.flush := rrwinzFlush
+    // 仅在 EX 真正前移时释放 done 状态，防止下级反压导致结果丢失。
+    rrwinz.io.consume := rrwinzConsume
+    // RRWINZ 的两个源分别是旧 rd 与 rj，I16 只使用低 16 位。
+    rrwinz.io.oldRd := exReg.lane(0).pipe.src2_value
+    rrwinz.io.rj := exReg.lane(0).pipe.src1_value
+    rrwinz.io.imm := exReg.lane(0).pipe.imm(15, 0)
+
+    // RRWINZ 与 MUL/DIV 一样阻塞 EX，直到多周期单元锁存完整结果。
     val exReadyGo = !exValid ||
-        (!exIsMul && !exIsDiv) ||
+        (!exIsMul && !exIsDiv && !exIsRrwinz) ||
         (exIsMul && multiplier.io.done) ||
-        (exIsDiv && (divFinished || divider.io.done))
+        (exIsDiv && (divFinished || divider.io.done)) ||
+        (exIsRrwinz && rrwinz.io.done)
 
     val exForwardResult = Wire(Vec(2, UInt(32.W)))
     val exAlignmentException = Wire(Vec(2, Bool()))
@@ -392,7 +412,9 @@ class DualBackend extends Module {
             Mux(pipe.rdtimel, io.timer(31, 0),
             Mux(pipe.rdtimeh, io.timer(63, 32),
             Mux(pipe.isCsr, src2, baseResult))))
-        val result = Mux(pipe.resFromMulDiv, currentMduResult, nonMduResult)
+        // RRWINZ 选择专用单元结果；其他指令仍走原 MDU/普通结果路径。
+        val result = Mux(pipe.isRrwinz, rrwinz.io.result,
+            Mux(pipe.resFromMulDiv, currentMduResult, nonMduResult))
         // Never expose the unified MDU result mux to ID.  MUL is registered at
         // the M1 boundary and DIV is blocking; both are marked not-ready by
         // the EX producer.  Keeping this bus MDU-free prevents a DSP cascade
@@ -679,6 +701,9 @@ class DualBackend extends Module {
     val exFire = exValid && exReadyGo && m1AllowIn && !m1LateFault
     multiplierFlush := wbFlush || m1LateFault
     multiplierConsume := exIsMul && exFire
+    // 连接放在 late-fault 定义之后，避免 Scala elaboration 的前向初始化引用。
+    rrwinzFlush := wbFlush || m1LateFault
+    rrwinzConsume := exIsRrwinz && exFire
 
     val lane0ArchitecturalBranchEvent = exReg.valid(0) &&
         (exReg.lane(0).pipe.brType =/= BrType.NOP ||
@@ -756,7 +781,8 @@ class DualBackend extends Module {
         val isBranch = op6 === BitPat("b01011?") || op6 === BitPat("b0110??")
         val isCsrWrite = inst(31, 24) === "h04".U && inst(9, 5) =/= 0.U
         val src1 = inst(9, 5)
-        val src2 = Mux(isStore || isSc || isBranch || isCsrWrite,
+        // 常规 R 型 src2 在 rk=inst[14:10]；RRWINZ 特殊地读取旧 rd=inst[4:0]。
+        val src2 = Mux(isStore || isSc || isBranch || isCsrWrite || dec.isRrwinz,
             inst(4, 0), inst(14, 10))
         regfile.io.raddr(2 * lane) := src1
         regfile.io.raddr(2 * lane + 1) := src2
@@ -793,6 +819,8 @@ class DualBackend extends Module {
         d.rdtimel := dec.rdtimel
         d.rdtimeh := dec.rdtimeh
         d.isCpucfg := dec.isCpucfg
+        // 保存译码出的 RRWINZ 身份，防止它在 ID/IS 缓冲等待期间丢失。
+        d.isRrwinz := dec.isRrwinz
         d.tlbOp := dec.tlbOp
         d.invtlb_op := dec.invtlb_op
         d.is_refetch := dec.is_refetch
@@ -811,9 +839,10 @@ class DualBackend extends Module {
         d.esubcode := io.fetchBits(lane).esubcode
         d.src1Read := dec.src1_read
         d.src2Read := dec.src2_read
+        // RRWINZ 只允许作为 lane0 单发，简化多周期状态和精确提交控制。
         d.serializing := dec.isCsr || dec.tlbOp =/= TlbOp.NOP || dec.is_cacop ||
             dec.is_refetch || dec.inst_ertn || dec.isLL || dec.isSC ||
-            isIdle || d.hasException
+            isIdle || dec.isRrwinz || d.hasException
     }
 
     // ---------------------------------------------------------------------
@@ -836,7 +865,9 @@ class DualBackend extends Module {
         val pipe = exReg.lane(lane).pipe
         Producer(exReg.valid(lane), pipe.regWriteEn && !pipe.hasException,
             pipe.destReg, exForwardResult(lane),
-            !pipe.resFromMem && !pipe.isCsr && !pipe.resFromMulDiv)
+            // RRWINZ 完成前结果不可前递，消费者必须像等待 MDU 一样停顿。
+            !pipe.resFromMem && !pipe.isCsr && !pipe.resFromMulDiv &&
+                !pipe.isRrwinz)
     }
     val m1aProducers = (1 to 0 by -1).map { lane =>
         val pipe = m1Reg.lane(lane).pipe
@@ -931,6 +962,8 @@ class DualBackend extends Module {
         pipe.rdtimel := d.rdtimel
         pipe.rdtimeh := d.rdtimeh
         pipe.isCpucfg := d.isCpucfg
+        // 将控制位装入通用 PipelineData，使 EX 及后续写回选择保持一致。
+        pipe.isRrwinz := d.isRrwinz
         pipe.tlbOp := d.tlbOp
         pipe.invtlb_op := d.invtlb_op
         pipe.is_refetch := d.is_refetch
