@@ -100,7 +100,7 @@ class PipelineData extends Bundle{
     val rdtimel         = Bool()
     val rdtimeh         = Bool()
     val isCpucfg        = Bool()
-    // RRWINZ 身份随体系结构载荷穿过 EX/M1/M1b/M2/WB，控制最终结果写回。
+    // MAX.WU 身份穿过流水线，控制专用单元结果写回。
     val isMaxwu        = Bool()
 
     //TLB
