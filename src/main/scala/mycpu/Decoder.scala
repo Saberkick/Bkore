@@ -36,7 +36,7 @@ class DecodeOut extends Bundle{
     val rdtimeh         = Bool()
     val isCpucfg        = Bool()
     // RRWINZ 的专用控制位；避免占用普通 ALU 的 one-hot 操作编码。
-    val isRrwinz        = Bool()
+    val isMaxwu         = Bool()
 
     val src1_read       = Bool()
     val src2_read       = Bool()
@@ -159,10 +159,10 @@ class Decoder extends Module{
     //   rrwinz rd, rj, I16   opcode[31:26] = 111000
     // I16 is carried without sign extension or scaling because its three
     // five-bit sub-fields describe bit-window positions and width.
-    val is_rrwinz = inst(31, 26) === "b111000".U
+    val is_maxwu = inst(31, 15) === "b11100100000000000".U
 
     // RRWINZ 需要原始 I16，不能复用分支 SI16 的符号扩展和左移两位。
-    io.out.imm := Mux(is_rrwinz, Cat(0.U(16.W), i16), Mux1H(Seq(
+    io.out.imm := Mux1H(Seq(
         (imm_s === Imm.UI5.asUInt)  -> Cat(0.U(27.W), inst(14, 10)),
         (imm_s === Imm.SI12.asUInt) -> Cat(Fill(20, i12(11)), i12),
         (imm_s === Imm.UI12.asUInt) -> Cat(0.U(20.W), i12),
@@ -170,7 +170,7 @@ class Decoder extends Module{
         (imm_s === Imm.SI16.asUInt) -> Cat(Fill(14, i16(15)), i16, 0.U(2.W)),
         (imm_s === Imm.SI20.asUInt) -> Cat(i20, 0.U(12.W)),
         (imm_s === Imm.SI26.asUInt) -> Cat(Fill(4, i26(25)), i26, 0.U(2.W))
-    )))
+    ))
 
 
     io.out.aluOp        := alu_s
@@ -249,13 +249,13 @@ class Decoder extends Module{
     io.out.rdtimeh      := is_timer_h
     io.out.isCpucfg     := is_cpucfg
     // 将自定义指令身份随译码结果送入后端，而不是重新解码流水中的 inst。
-    io.out.isRrwinz     := is_rrwinz
+    io.out.isMaxwu     := is_maxwu
 
     // RRWINZ 将旋转后的窗口写回编码中的 rd。
-    io.out.regWe        := (reg_we === 1.U) || is_csr || is_rdtime_base || is_cpucfg || is_rrwinz
+    io.out.regWe        := (reg_we === 1.U) || is_csr || is_rdtime_base || is_cpucfg || is_maxwu
     io.out.destReg :=   Mux(is_rdcntid, rj, 
                         // RRWINZ 的目的寄存器与普通 rd 型指令一致。
-                        Mux(is_rdtime_base || is_csr || is_cpucfg || is_rrwinz, rd,
+                        Mux(is_rdtime_base || is_csr || is_cpucfg || is_maxwu, rd,
                         Mux1H(Seq(
                             (dst_s === Dst.RD.asUInt) -> rd,
                             (dst_s === Dst.RJ.asUInt) -> rj,
@@ -271,7 +271,7 @@ class Decoder extends Module{
 
     // opcode 111000 是合法的现场扩展指令，不能触发 RI 异常。
     val inst_valid      =   (alu_s =/= AluOp.NOP) || (ls_s =/= LsOp.NOP) || (mdu_s =/= MduOp.NOP) || (br_t =/= BrType.NOP) || 
-                            is_syscall || is_break || is_ertn || is_idle || is_preld || is_barrier || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop || is_rrwinz
+                            is_syscall || is_break || is_ertn || is_idle || is_preld || is_barrier || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop || is_maxwu
 
     io.out.hasException := !inst_valid || is_syscall || is_break
     io.out.ecode        :=  Mux(is_syscall, "h0B".U(6.W), 
@@ -284,6 +284,6 @@ class Decoder extends Module{
     val csr_reads_src2 = is_csr && !rj_is_zero
 
     // RRWINZ 同时读取 rj 和旧 rd：rj 提供计数窗口，旧 rd 提供旋转窗口。
-    io.out.src1_read := inst_valid && (r1_re === 1.U || csr_reads_src1 || is_cpucfg || is_rrwinz)
-    io.out.src2_read := inst_valid && (r2_re === 1.U || csr_reads_src2 || is_rrwinz)
+    io.out.src1_read := inst_valid && (r1_re === 1.U || csr_reads_src1 || is_cpucfg || is_maxwu)
+    io.out.src2_read := inst_valid && (r2_re === 1.U || csr_reads_src2 || is_maxwu)
 }
