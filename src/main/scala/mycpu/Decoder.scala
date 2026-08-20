@@ -12,7 +12,7 @@ class DecodeOut extends Bundle{
     val aluOp           = UInt(12.W)
     val lsOp            = UInt(8.W)
     val mduOp           = UInt(7.W)
-    val brType          = UInt(9.W)
+    val brType          = UInt(10.W)
 
     val imm             = UInt(32.W)
     val src1IsPC        = Bool()
@@ -122,6 +122,10 @@ class Decoder extends Module{
         BitPat("b011001_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BGE, 1.U, 1.U),  // bge
         BitPat("b011010_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BLTU,1.U, 1.U), // bltu
         BitPat("b011011_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BGEU,1.U, 1.U),  // bgeu
+        // bgeuand rj, rd, offs16
+        // Take when rj >=u rd and the operands share at least one set bit.
+        // The target is PC + SignExtend(offs16 << 2), like BEQ/BGEU.
+        BitPat("b011100_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BGEUAND,1.U,1.U), // custom bgeuand
 
         BitPat("b000001_1001_00_10000_01010_00000_00000")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.X,  Src2.X,    Imm.X,     Dst.X,   0.U, 0.U, BrType.NOP, 0.U, 0.U), // tlbsrch
         BitPat("b000001_1001_00_10000_01011_00000_00000")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.X,  Src2.X,    Imm.X,     Dst.X,   0.U, 0.U, BrType.NOP, 0.U, 0.U), // tlbrd

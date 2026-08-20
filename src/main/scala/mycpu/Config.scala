@@ -35,9 +35,12 @@ object MduOp{
 }
 
 object BrType{
-    private val oh = new OneHotGenerator(9)
+    private val oh = new OneHotGenerator(10)
     val NOP = oh.NOP
-    val BEQ, BNE, BLT, BGE, BLTU, BGEU, JIRL, B, BL = oh.nxt
+    // Keep the existing values stable and append custom branch types.  This
+    // makes a custom condition an explicit pipeline identity instead of
+    // disguising it as one of the architectural branches.
+    val BEQ, BNE, BLT, BGE, BLTU, BGEU, JIRL, B, BL, BGEUAND = oh.nxt
 }
 
 object TlbOp{

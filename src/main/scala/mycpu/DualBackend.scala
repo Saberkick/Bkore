@@ -429,10 +429,12 @@ class DualBackend extends Module {
         val eq = pipe.src1_value === pipe.src2_value
         val lt = pipe.src1_value.asSInt < pipe.src2_value.asSInt
         val ltu = pipe.src1_value < pipe.src2_value
+        val hasCommonOne = (pipe.src1_value & pipe.src2_value).orR
         branchTaken(lane) := MuxLookup(pipe.brType, false.B)(Seq(
             BrType.BEQ -> eq, BrType.BNE -> !eq, BrType.BLT -> lt,
             BrType.BGE -> !lt, BrType.BLTU -> ltu, BrType.BGEU -> !ltu,
-            BrType.JIRL -> true.B, BrType.B -> true.B, BrType.BL -> true.B
+            BrType.JIRL -> true.B, BrType.B -> true.B, BrType.BL -> true.B,
+            BrType.BGEUAND -> (!ltu && hasCommonOne)
         ))
         val base = Mux(pipe.brType === BrType.JIRL, pipe.src1_value, pipe.pc)
         branchTarget(lane) := base + pipe.imm
@@ -753,7 +755,10 @@ class DualBackend extends Module {
             dec.inst_ertn || isIdle
         val privilegeViolation = csr.io.mmu_config.crmd.plv =/= 0.U &&
             isPrivileged
-        val isBranch = op6 === BitPat("b01011?") || op6 === BitPat("b0110??")
+        // All two-register conditional branches place their second source in
+        // rd[4:0].  Derive this choice from decoded identity so a newly added
+        // opcode cannot silently read rk[14:10] instead.
+        val isBranch = dec.brType =/= BrType.NOP
         val isCsrWrite = inst(31, 24) === "h04".U && inst(9, 5) =/= 0.U
         val src1 = inst(9, 5)
         val src2 = Mux(isStore || isSc || isBranch || isCsrWrite,

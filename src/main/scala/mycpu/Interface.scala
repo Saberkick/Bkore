@@ -62,7 +62,7 @@ class PipelineData extends Bundle{
     //Used in EX
     val aluOp           = UInt(12.W)
     val mduOp           = UInt(7.W)
-    val brType          = UInt(9.W)
+    val brType          = UInt(10.W)
     val imm             = UInt(32.W)
     val src1IsPC        = Bool()
     val src2IsImm       = Bool()
