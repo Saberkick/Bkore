@@ -74,7 +74,7 @@ class PipelineData extends Bundle{
     val resFromMulDiv   = Bool()
     //Used in MEM
     val memWe           = Bool()
-    val lsOp            = UInt(8.W)
+    val lsOp            = UInt(9.W)
     //Used in WB
     val resFromMem      = Bool()
     val regWriteEn      = Bool()

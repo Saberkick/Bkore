@@ -253,7 +253,8 @@ class DualBackend extends Module {
                 LsOp.LD_BU -> "h02".U,
                 LsOp.LD_H  -> "h04".U,
                 LsOp.LD_HU -> "h08".U,
-                LsOp.LD_W  -> "h10".U)))
+                LsOp.LD_W  -> "h10".U,
+                LsOp.LDMAXU_W -> "h10".U)))
         val difftestLoad = Module(new DifftestLoadEventSim())
         difftestLoad.clock := clock
         difftestLoad.coreid := 0.U
@@ -399,7 +400,8 @@ class DualBackend extends Module {
         // from leaking through source forwarding into issue/popCount.
         exForwardResult(lane) := nonMduResult
 
-        val isWord = pipe.lsOp === LsOp.LD_W || pipe.lsOp === LsOp.ST_W
+        val isWord = pipe.lsOp === LsOp.LD_W ||
+            pipe.lsOp === LsOp.LDMAXU_W || pipe.lsOp === LsOp.ST_W
         val isHalf = pipe.lsOp === LsOp.LD_H || pipe.lsOp === LsOp.LD_HU ||
             pipe.lsOp === LsOp.ST_H
         exAlignmentException(lane) := exReg.valid(lane) &&
@@ -591,7 +593,8 @@ class DualBackend extends Module {
         val cacopIndex = pipe.is_cacop && pipe.cacop_op(4, 3) =/= "b10".U
         val address = Cat(Mux(cacopIndex, m1Va(lane)(31, 12),
             m1Pa(lane)(31, 12)), m1Va(lane)(11, 0))
-        val word = pipe.lsOp === LsOp.LD_W || pipe.lsOp === LsOp.ST_W
+        val word = pipe.lsOp === LsOp.LD_W ||
+            pipe.lsOp === LsOp.LDMAXU_W || pipe.lsOp === LsOp.ST_W
         val half = pipe.lsOp === LsOp.LD_H ||
             pipe.lsOp === LsOp.LD_HU || pipe.lsOp === LsOp.ST_H
         val byteMask = "b0001".U(4.W) << m1Va(lane)(1, 0)
@@ -656,13 +659,17 @@ class DualBackend extends Module {
             LsOp.LD_BU -> Cat(0.U(24.W), byte),
             LsOp.LD_H -> Cat(Fill(16, half(15)), half),
             LsOp.LD_HU -> Cat(0.U(16.W), half),
-            LsOp.LD_W -> rdata
+            LsOp.LD_W -> rdata,
+            LsOp.LDMAXU_W -> rdata
         ))
+        val finalLoadResult = Mux(pipe.lsOp === LsOp.LDMAXU_W,
+            Mux(rdata >= pipe.src2_value, rdata, pipe.src2_value),
+            loadResult)
         when(m2Reg.valid(lane) && m2Reg.lane(lane).waitDcache &&
                 io.dcache(lane).data_ok) {
             m2Out.lane(lane).dcacheDone := true.B
             when(pipe.resFromMem) {
-                m2Out.lane(lane).pipe.ex_result := loadResult
+                m2Out.lane(lane).pipe.ex_result := finalLoadResult
             }
         }
     }
@@ -755,8 +762,9 @@ class DualBackend extends Module {
             isPrivileged
         val isBranch = op6 === BitPat("b01011?") || op6 === BitPat("b0110??")
         val isCsrWrite = inst(31, 24) === "h04".U && inst(9, 5) =/= 0.U
+        val readsOldRd = dec.lsOp === LsOp.LDMAXU_W
         val src1 = inst(9, 5)
-        val src2 = Mux(isStore || isSc || isBranch || isCsrWrite,
+        val src2 = Mux(isStore || isSc || isBranch || isCsrWrite || readsOldRd,
             inst(4, 0), inst(14, 10))
         regfile.io.raddr(2 * lane) := src1
         regfile.io.raddr(2 * lane + 1) := src2

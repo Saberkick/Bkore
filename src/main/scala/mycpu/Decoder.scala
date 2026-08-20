@@ -10,7 +10,7 @@ private object Imm  extends ChiselEnum{val X, SI12, UI12, SI14, SI16, SI20, SI26
 
 class DecodeOut extends Bundle{
     val aluOp           = UInt(12.W)
-    val lsOp            = UInt(8.W)
+    val lsOp            = UInt(9.W)
     val mduOp           = UInt(7.W)
     val brType          = UInt(9.W)
 
@@ -106,6 +106,10 @@ class Decoder extends Module{
         BitPat("b001010_0010_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.w
         BitPat("b001010_1000_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_BU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.bu
         BitPat("b001010_1001_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_HU, MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.hu
+        // ldmaxu.w rd, rj, si12: load a word, then write the unsigned maximum
+        // of that word and the pre-instruction value of rd.  R2 marks old rd
+        // as a real source; ID selects rd[4:0] instead of rk[14:10].
+        BitPat("b001010_1010_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LDMAXU_W,MduOp.NOP, Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // custom ldmaxu.w
         BitPat("b00100000_??????????????_?????_?????")       -> row(AluOp.ADD,   LsOp.LD_W,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI14,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ll.w
 
         BitPat("b001010_0100_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.ST_B,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.X,   0.U, 1.U, BrType.NOP, 1.U, 1.U), // st.b

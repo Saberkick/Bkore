@@ -63,7 +63,7 @@ class DecodedLane extends Bundle {
 
     // consumed in MEM / WB
     val memWe       = Bool()
-    val lsOp        = UInt(8.W)
+    val lsOp        = UInt(9.W)
     val resFromMem  = Bool()
     val regWriteEn  = Bool()
     val destReg     = UInt(5.W)

@@ -23,9 +23,11 @@ object AluOp{
 }
 
 object LsOp{
-    private val oh = new OneHotGenerator(8)
+    private val oh = new OneHotGenerator(9)
     val NOP = oh.NOP
-    val LD_B, LD_H, LD_W, LD_BU, LD_HU, ST_B, ST_H, ST_W = oh.nxt
+    // Append custom operations so the existing one-hot values stay stable.
+    val LD_B, LD_H, LD_W, LD_BU, LD_HU, ST_B, ST_H, ST_W,
+        LDMAXU_W = oh.nxt
 }
 
 object MduOp{
