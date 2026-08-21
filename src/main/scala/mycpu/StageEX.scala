@@ -56,6 +56,7 @@ class StageEX extends Module {
                   data_reg.mduOp === MduOp.MULH_WU) && !data_reg.hasException
     
     val is_mdu = data_reg.resFromMulDiv && !data_reg.hasException
+    val is_rrwinz = data_reg.isRrwinz && !data_reg.hasException
 
     val mdu_busy = RegInit(false.B)
     val mdu_finished = RegInit(false.B)
@@ -97,6 +98,15 @@ class StageEX extends Module {
 
     val src1_fwd = MuxCase(data_reg.src1_value, Seq(s1_mem_hit -> io.fwdFromMem.result, s1_wb_hit -> io.fwdFromWb.result))
     val src2_fwd = MuxCase(data_reg.src2_value, Seq(s2_mem_hit -> io.fwdFromMem.result, s2_wb_hit -> io.fwdFromWb.result))
+
+    val rrwinz = Module(new RrwinzUnit())
+    rrwinz.io.enable := valid_reg && is_rrwinz
+    rrwinz.io.flush := io.flush
+    rrwinz.io.consume := valid_reg && is_rrwinz && ready_go && io.out.ready
+    rrwinz.io.rj := src1_fwd
+    rrwinz.io.oldRd := src2_fwd
+    rrwinz.io.imm := data_reg.imm(15, 0)
+    val rrwinz_ready = !is_rrwinz || rrwinz.io.done
 
     when(valid_reg && !allow_in) {
         data_reg.src1_value := src1_fwd
@@ -222,12 +232,14 @@ class StageEX extends Module {
     // Report no optional cache capability for now.  The NSCSCC startup code
     // will consequently skip CACOP-based I/D/L2 cache initialization.
     val cpucfg_result = 0.U(32.W)
-    val final_ex_result = Mux(data_reg.isCpucfg, cpucfg_result,
+    val normal_ex_result = Mux(data_reg.isCpucfg, cpucfg_result,
                           Mux(is_tlbsrch, tlbsrch_res,
                           Mux(data_reg.rdtimel, io.timer_in(31, 0),
                           Mux(data_reg.rdtimeh, io.timer_in(63, 32),
                           Mux(data_reg.isCsr, src2_fwd, 
                           Mux(data_reg.resFromMulDiv, mdu_res, alu_res))))))
+    val final_ex_result = Mux(data_reg.isRrwinz,
+        rrwinz.io.result, normal_ex_result)
 
     // 强制 tlbsrch 只能修改 TLBIDX 的第 31 位(NE) 和低 4 位(Index)
     val aux_data = Mux(is_tlbsrch, tlbsrch_mask, 
@@ -291,7 +303,8 @@ class StageEX extends Module {
     val wdata_h = Fill(2, src2_fwd(15, 0))
     io.data_sram.wdata := Mux(isWord, src2_fwd, Mux(isHalf, wdata_h, wdata_b))
     //MODDED in AXI experiment
-    ready_go := mdu_ready && (!is_mem_inst || io.data_sram.addr_ok || mem_req_sent)
+    ready_go := mdu_ready && rrwinz_ready &&
+        (!is_mem_inst || io.data_sram.addr_ok || mem_req_sent)
 
     //
     val out_data = WireDefault(data_reg) 

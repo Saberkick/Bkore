@@ -27,8 +27,9 @@ class StageID extends Module {
     val op6 = data_reg.inst(31, 26)
     val is_store = (op6 === "b001010".U) && (data_reg.inst(24) === 1.U)
     val is_branch = (data_reg.inst(31, 26) === BitPat("b01011?")) || (data_reg.inst(31, 26) === BitPat("b0110??"))
+    val is_rrwinz = data_reg.inst(31, 26) === "b111000".U
     val is_csr_write = (data_reg.inst(31, 24) === "h04".U) && (data_reg.inst(9, 5) =/= 0.U)
-    val src2IsRd = is_store || is_branch || is_csr_write
+    val src2IsRd = is_store || is_branch || is_csr_write || is_rrwinz
 
     val src1_addr = data_reg.inst(9, 5) //rj
     val src2_addr = Mux(src2IsRd, data_reg.inst(4, 0), data_reg.inst(14, 10)) //rkd
@@ -86,6 +87,7 @@ class StageID extends Module {
     out_data.rdtimel       := dec.rdtimel
     out_data.rdtimeh       := dec.rdtimeh
     out_data.isCpucfg      := dec.isCpucfg
+    out_data.isRrwinz      := dec.isRrwinz
     
     out_data.src1_addr     := src1_addr
     out_data.src2_addr     := src2_addr

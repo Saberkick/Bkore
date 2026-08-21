@@ -1,0 +1,174 @@
+﻿{
+    "schemaVersion":  1,
+    "variant":  "Dual",
+    "generatedUtc":  "2026-08-20T13:25:11.2586911Z",
+    "topModule":  "core_top",
+    "simulationDividerIncluded":  false,
+    "files":  [
+                  {
+                      "name":  "ALU.sv",
+                      "bytes":  1131,
+                      "sha256":  "43f33d0e66265d53064aa0309175d6cfc88c51db814a0aeedb71c7311d00aaf4"
+                  },
+                  {
+                      "name":  "bht_512x6.sv",
+                      "bytes":  640,
+                      "sha256":  "ea35d014f93d6b455bf644b03f9d29af8911b51c868599ef6ac5d0c4b6061f7a"
+                  },
+                  {
+                      "name":  "btb_512x55.sv",
+                      "bytes":  653,
+                      "sha256":  "579dec227caf8c143e0eda838f80ccbbc3142a56993a8554ae648dc74ce97c39"
+                  },
+                  {
+                      "name":  "btbValid_512x1.sv",
+                      "bytes":  615,
+                      "sha256":  "0af46b392fa8e4b35e24bb556e6951a0d63ef37a90810a06b7c198e6a0c24956"
+                  },
+                  {
+                      "name":  "Cache.sv",
+                      "bytes":  371646,
+                      "sha256":  "6a237ce93d32610c87713c711d3beba4892a96fb6f3f098a9fcb954d84e9ffde"
+                  },
+                  {
+                      "name":  "core_top.sv",
+                      "bytes":  34878,
+                      "sha256":  "0d8ffe279b57201f5204a65101bacb57bfe9447c61740698e2c8282e6dd460a3"
+                  },
+                  {
+                      "name":  "data_256x128.sv",
+                      "bytes":  667,
+                      "sha256":  "a33287817ec3c9db3e44839d23a5f671729bd6ddc0c96fc9304990e93ca57abe"
+                  },
+                  {
+                      "name":  "data_way_256x32.sv",
+                      "bytes":  957,
+                      "sha256":  "fe4e075b7fcbbcfee0cdc3bb9b120692318f8152e69396a73ecae37170c7b6dc"
+                  },
+                  {
+                      "name":  "Decoder.sv",
+                      "bytes":  21026,
+                      "sha256":  "e51dfe6a54f5a4c56a1af9733ddb3b600adb0d1b598a2da6d9d1892ea55943d8"
+                  },
+                  {
+                      "name":  "DifftestCSRRegStateSim.sv",
+                      "bytes":  1595,
+                      "sha256":  "e4da9bb7aea4f0b3f6d375d8827700a4049646283b6f4220e742404212a14fd3"
+                  },
+                  {
+                      "name":  "DifftestExcpEventSim.sv",
+                      "bytes":  610,
+                      "sha256":  "8c0c2554b38adf31f6352a6704241e144dec782fbf5b51c41d728117fe390839"
+                  },
+                  {
+                      "name":  "DifftestGRegStateSim.sv",
+                      "bytes":  1857,
+                      "sha256":  "095c54cfa3879d2f6f3d5f2262bc01c84430d600b3b9e1577c196406c50d7bab"
+                  },
+                  {
+                      "name":  "DifftestInstrCommitSim.sv",
+                      "bytes":  1041,
+                      "sha256":  "8c1da13173fb6d76707b0871dd0ecf2ba1e7f5584e79a3c01fb69b33cac15558"
+                  },
+                  {
+                      "name":  "DifftestLoadEventSim.sv",
+                      "bytes":  453,
+                      "sha256":  "86891669ed231341a78964dff8f44cc7127ee8369ff7df6b18233b69f8c45b46"
+                  },
+                  {
+                      "name":  "DifftestStoreEventSim.sv",
+                      "bytes":  547,
+                      "sha256":  "3fa32e4dd460a7f63f9fa3479d8686ff1dd764f0f16bc394aaab850814b97b5e"
+                  },
+                  {
+                      "name":  "Divider.sv",
+                      "bytes":  3486,
+                      "sha256":  "a93678c61537569c9d2216acadb195b85e69c3560a3791f9ead9105baa2e5cc3"
+                  },
+                  {
+                      "name":  "DualBackend.sv",
+                      "bytes":  234779,
+                      "sha256":  "26f96e39973543fc3edf2c6ff67eca1566d5773d3dd5fe0f384ac3dbd27f3061"
+                  },
+                  {
+                      "name":  "DualBankDCache.sv",
+                      "bytes":  11132,
+                      "sha256":  "0d287a03b529356a5ff195b5a2d75a9ce976301758d085c5ce57a3a06f8f46f5"
+                  },
+                  {
+                      "name":  "DualBranchPredictor.sv",
+                      "bytes":  105524,
+                      "sha256":  "776481e3a4af6ac6216d87730892b163205b5d4ac4af07eebf74269e73360805"
+                  },
+                  {
+                      "name":  "DualFrontend.sv",
+                      "bytes":  18820,
+                      "sha256":  "97726d03ab87c2a6c23704675ae2ba9b0c09f857cc4cf542e15674860914bb88"
+                  },
+                  {
+                      "name":  "DualICache.sv",
+                      "bytes":  247871,
+                      "sha256":  "03f579cbc8dd1e6dcf6df826b3b7810bf150bc5accdbab51b873081dab1e8694"
+                  },
+                  {
+                      "name":  "DualInstructionQueue.sv",
+                      "bytes":  20950,
+                      "sha256":  "9dd2910256b2520ae8c0786dfcf8bd90b23aa9b6a8e64e87a1729d62e1b4d049"
+                  },
+                  {
+                      "name":  "DualIssueUnit.sv",
+                      "bytes":  2397,
+                      "sha256":  "6a5384108fa21aed8db903b57f634e063385f0d45dd1343c70ef506ed62e8354"
+                  },
+                  {
+                      "name":  "filelist.f",
+                      "bytes":  789,
+                      "sha256":  "df0ca9dd25f3c9ab1dc68708b8fb67773c16f2071482fc67ace7f068ca91123b"
+                  },
+                  {
+                      "name":  "Multiplier.sv",
+                      "bytes":  1494,
+                      "sha256":  "81bb94d1f88e1d55f27f899d85a65d99f9ffcf211310e65b3a19043d9d579969"
+                  },
+                  {
+                      "name":  "MyCpuCSR.sv",
+                      "bytes":  38363,
+                      "sha256":  "8660d29ea3a5591586fee0313272a883fe88e37cb4ddf8ff3f7de8fb1a51edca"
+                  },
+                  {
+                      "name":  "Regfile4R2W.sv",
+                      "bytes":  16746,
+                      "sha256":  "c5b3c70720c08d5a20980377b6d1e14eb5574b1a1819d1b0c4a8f4abba83d5af"
+                  },
+                  {
+                      "name":  "RrwinzUnit.sv",
+                      "bytes":  13945,
+                      "sha256":  "6e7d17bd13bb3c3fba5fcdbf181d417b2f560eccdcc1205c113c86a6b23963c1"
+                  },
+                  {
+                      "name":  "SramToAxiBridge.sv",
+                      "bytes":  7021,
+                      "sha256":  "34c2e06fe96bcf42aee9910121e5de3d959541a67e2060bceb79a601b8ce22a5"
+                  },
+                  {
+                      "name":  "StableCounter.sv",
+                      "bytes":  705,
+                      "sha256":  "c7544290a17af967a60e97de3b1b01cc7dd92b1547a67ac1d6648c7a08cfd05a"
+                  },
+                  {
+                      "name":  "tag_256x20.sv",
+                      "bytes":  653,
+                      "sha256":  "9a252f7d3fa811d54ad64b39d974368a320ac10d420b0847603b2551374e67a6"
+                  },
+                  {
+                      "name":  "tagv_way_256x21.sv",
+                      "bytes":  773,
+                      "sha256":  "b4729ad05c33508bb11f51ee12708d2d480be9f6b5287b12552260f73839ff98"
+                  },
+                  {
+                      "name":  "tlb.sv",
+                      "bytes":  149178,
+                      "sha256":  "a570cfddde9bc247c255d3f3dcb6a24d3c4e77bf2ece30cae4c74330d8271e54"
+                  }
+              ]
+}
