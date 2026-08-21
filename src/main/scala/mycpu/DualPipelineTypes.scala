@@ -49,7 +49,7 @@ class DecodedLane extends Bundle {
 
     // ID generated, consumed in EX
     val aluOp        = UInt(12.W)
-    val mduOp        = UInt(7.W)
+    val mduOp        = UInt(8.W)
     val brType       = UInt(9.W)
     val imm          = UInt(32.W)
     val src1IsPC     = Bool()

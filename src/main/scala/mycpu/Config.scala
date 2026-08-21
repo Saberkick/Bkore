@@ -31,9 +31,10 @@ object LsOp{
 }
 
 object MduOp{
-    private val oh = new OneHotGenerator(7)
+    private val oh = new OneHotGenerator(8)
     val NOP = oh.NOP
-    val MUL_W, MULH_W, MULH_WU, DIV_W, MOD_W, DIV_WU, MOD_WU = oh.nxt
+    // SAVE is appended so all existing one-hot encodings remain unchanged.
+    val MUL_W, MULH_W, MULH_WU, DIV_W, MOD_W, DIV_WU, MOD_WU, SAVE = oh.nxt
 }
 
 object BrType{

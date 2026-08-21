@@ -11,7 +11,7 @@ private object Imm  extends ChiselEnum{val X, SI12, UI12, SI14, SI16, SI20, SI26
 class DecodeOut extends Bundle{
     val aluOp           = UInt(12.W)
     val lsOp            = UInt(9.W)
-    val mduOp           = UInt(7.W)
+    val mduOp           = UInt(8.W)
     val brType          = UInt(9.W)
 
     val imm             = UInt(32.W)
@@ -100,6 +100,10 @@ class Decoder extends Module{
         BitPat("b000000_0000_10_00001_?????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.MOD_W, Src1.R,  Src2.R,    Imm.X,     Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // mod.w
         BitPat("b000000_0000_10_00010_?????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.DIV_WU,Src1.R,  Src2.R,    Imm.X,     Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // div.wu
         BitPat("b000000_0000_10_00011_?????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.MOD_WU,Src1.R,  Src2.R,    Imm.X,     Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // mod.wu
+
+        // save rd, rj, rk: eight-round state avalanche implemented by a
+        // dedicated iterative unit.  Bits [25:15] are fixed to zero.
+        BitPat("b110010_00000000000_?????_?????_?????")      -> row(AluOp.NOP,   LsOp.NOP,   MduOp.SAVE,  Src1.R,  Src2.R,    Imm.X,     Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // custom save
         
         BitPat("b001010_0000_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_B,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.b
         BitPat("b001010_0001_????_????_????_?????_?????")   -> row(AluOp.ADD,   LsOp.LD_H,  MduOp.NOP,   Src1.R,  Src2.IMM,  Imm.SI12,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 0.U), // ld.h

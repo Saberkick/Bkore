@@ -322,6 +322,8 @@ class DualBackend extends Module {
          exReg.lane(0).pipe.mduOp === MduOp.MOD_W ||
          exReg.lane(0).pipe.mduOp === MduOp.DIV_WU ||
          exReg.lane(0).pipe.mduOp === MduOp.MOD_WU)
+    val exIsSave = exReg.valid(0) && !exReg.lane(0).pipe.hasException &&
+        exReg.lane(0).pipe.mduOp === MduOp.SAVE
 
     // MUL and a younger simple ALU may share an EX packet.  Keep the packet
     // resident until the registered 33x33 product is available.  This removes
@@ -364,10 +366,20 @@ class DualBackend extends Module {
     val currentMduResult = Mux(exIsMul, multiplier.io.result,
         Mux(divider.io.done, liveDivResult, divResult))
 
+    val save = Module(new SaveUnit())
+    val saveFlush = WireDefault(false.B)
+    val saveConsume = WireDefault(false.B)
+    save.io.enable := exIsSave
+    save.io.flush := saveFlush
+    save.io.consume := saveConsume
+    save.io.rj := exReg.lane(0).pipe.src1_value
+    save.io.rk := exReg.lane(0).pipe.src2_value
+
     val exReadyGo = !exValid ||
-        (!exIsMul && !exIsDiv) ||
+        (!exIsMul && !exIsDiv && !exIsSave) ||
         (exIsMul && multiplier.io.done) ||
-        (exIsDiv && (divFinished || divider.io.done))
+        (exIsDiv && (divFinished || divider.io.done)) ||
+        (exIsSave && save.io.done)
 
     val exForwardResult = Wire(Vec(2, UInt(32.W)))
     val exAlignmentException = Wire(Vec(2, Bool()))
@@ -393,7 +405,9 @@ class DualBackend extends Module {
             Mux(pipe.rdtimel, io.timer(31, 0),
             Mux(pipe.rdtimeh, io.timer(63, 32),
             Mux(pipe.isCsr, src2, baseResult))))
-        val result = Mux(pipe.resFromMulDiv, currentMduResult, nonMduResult)
+        val selectedMduResult = Mux(pipe.mduOp === MduOp.SAVE,
+            save.io.result, currentMduResult)
+        val result = Mux(pipe.resFromMulDiv, selectedMduResult, nonMduResult)
         // Never expose the unified MDU result mux to ID.  MUL is registered at
         // the M1 boundary and DIV is blocking; both are marked not-ready by
         // the EX producer.  Keeping this bus MDU-free prevents a DSP cascade
@@ -686,6 +700,8 @@ class DualBackend extends Module {
     val exFire = exValid && exReadyGo && m1AllowIn && !m1LateFault
     multiplierFlush := wbFlush || m1LateFault
     multiplierConsume := exIsMul && exFire
+    saveFlush := wbFlush || m1LateFault
+    saveConsume := exIsSave && exFire
 
     val lane0ArchitecturalBranchEvent = exReg.valid(0) &&
         (exReg.lane(0).pipe.brType =/= BrType.NOP ||
