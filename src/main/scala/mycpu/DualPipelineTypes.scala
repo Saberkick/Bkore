@@ -81,6 +81,8 @@ class DecodedLane extends Bundle {
     val isCpucfg     = Bool()
     // ID->IS 缓冲必须保存 RRWINZ 身份，等待源操作数和串行发射条件满足。
     val isRrwinz     = Bool()
+    // RRIWINZ 同样在 ID/IS 缓冲中保持专用指令身份。
+    val isRriwinz    = Bool()
 
     // TLB
     val tlbOp      = UInt(5.W)

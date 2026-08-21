@@ -102,6 +102,8 @@ class PipelineData extends Bundle{
     val isCpucfg        = Bool()
     // RRWINZ 身份随体系结构载荷穿过 EX/M1/M1b/M2/WB，控制最终结果写回。
     val isRrwinz        = Bool()
+    // RRIWINZ 身份随流水载荷进入 EX，并控制专用单元结果写回。
+    val isRriwinz       = Bool()
 
     //TLB
     val tlbOp           = UInt(5.W)

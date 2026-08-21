@@ -6,7 +6,7 @@ import chisel3.util._
 private object Src1 extends ChiselEnum{val X, R, PC = Value}
 private object Src2 extends ChiselEnum{val X, R, IMM = Value}
 private object Dst  extends ChiselEnum{val X, RD, RJ, R1 = Value}
-private object Imm  extends ChiselEnum{val X, SI12, UI12, SI14, SI16, SI20, SI26, UI5, FOUR = Value}
+private object Imm  extends ChiselEnum{val X, SI11, SI12, UI12, SI14, SI16, SI20, SI26, UI5, FOUR = Value}
 
 class DecodeOut extends Bundle{
     val aluOp           = UInt(12.W)
@@ -37,6 +37,8 @@ class DecodeOut extends Bundle{
     val isCpucfg        = Bool()
     // RRWINZ 的专用控制位；避免占用普通 ALU 的 one-hot 操作编码。
     val isRrwinz        = Bool()
+    // RRIWINZ 由独立多周期单元执行，SI11 在 Decoder 中先完成符号扩展。
+    val isRriwinz       = Bool()
 
     val src1_read       = Bool()
     val src2_read       = Bool()
@@ -125,6 +127,10 @@ class Decoder extends Module{
         BitPat("b011010_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BLTU,1.U, 1.U), // bltu
         BitPat("b011011_????_????_????_????_?????_?????")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI16,  Dst.X,   0.U, 0.U, BrType.BGEU,1.U, 1.U),  // bgeu
 
+        // rriwinz rd, rj, rk, si11: rd = ror(SignExtend(si11),
+        // max(nlz(rj[31:16]), nlz(rj[15:0]), nlz(rk[31:16]), nlz(rk[15:0]))).
+        BitPat("b110000_???????????_?????_?????_?????")      -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.R,  Src2.R,    Imm.SI11,  Dst.RD,  1.U, 0.U, BrType.NOP, 1.U, 1.U), // custom rriwinz
+
         BitPat("b000001_1001_00_10000_01010_00000_00000")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.X,  Src2.X,    Imm.X,     Dst.X,   0.U, 0.U, BrType.NOP, 0.U, 0.U), // tlbsrch
         BitPat("b000001_1001_00_10000_01011_00000_00000")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.X,  Src2.X,    Imm.X,     Dst.X,   0.U, 0.U, BrType.NOP, 0.U, 0.U), // tlbrd
         BitPat("b000001_1001_00_10000_01100_00000_00000")   -> row(AluOp.NOP,   LsOp.NOP,   MduOp.NOP,   Src1.X,  Src2.X,    Imm.X,     Dst.X,   0.U, 0.U, BrType.NOP, 0.U, 0.U), // tlbwr
@@ -150,6 +156,8 @@ class Decoder extends Module{
 
     val rj = inst(9, 5)
     val rd = inst(4, 0)
+    // RRIWINZ 的有符号立即数字段占据 inst[25:15]。
+    val i11 = inst(25, 15)
     val i12 = inst(21, 10)
     val i14 = inst(23, 10)
     val i16 = inst(25, 10)
@@ -160,10 +168,13 @@ class Decoder extends Module{
     // I16 is carried without sign extension or scaling because its three
     // five-bit sub-fields describe bit-window positions and width.
     val is_rrwinz = inst(31, 26) === "b111000".U
+    val is_rriwinz = inst(31, 26) === "b110000".U
 
     // RRWINZ 需要原始 I16，不能复用分支 SI16 的符号扩展和左移两位。
     io.out.imm := Mux(is_rrwinz, Cat(0.U(16.W), i16), Mux1H(Seq(
         (imm_s === Imm.UI5.asUInt)  -> Cat(0.U(27.W), inst(14, 10)),
+        // SI11 是二进制补码；复制 bit10 共 21 次得到完整 32 位操作数。
+        (imm_s === Imm.SI11.asUInt) -> Cat(Fill(21, i11(10)), i11),
         (imm_s === Imm.SI12.asUInt) -> Cat(Fill(20, i12(11)), i12),
         (imm_s === Imm.UI12.asUInt) -> Cat(0.U(20.W), i12),
         (imm_s === Imm.SI14.asUInt) -> Cat(Fill(16, i14(13)), i14, 0.U(2.W)),
@@ -250,6 +261,7 @@ class Decoder extends Module{
     io.out.isCpucfg     := is_cpucfg
     // 将自定义指令身份随译码结果送入后端，而不是重新解码流水中的 inst。
     io.out.isRrwinz     := is_rrwinz
+    io.out.isRriwinz    := is_rriwinz
 
     // RRWINZ 将旋转后的窗口写回编码中的 rd。
     io.out.regWe        := (reg_we === 1.U) || is_csr || is_rdtime_base || is_cpucfg || is_rrwinz
@@ -269,9 +281,9 @@ class Decoder extends Module{
     io.out.isLL := inst(31, 24) === "h20".U
     io.out.isSC := inst(31, 24) === "h21".U
 
-    // opcode 111000 是合法的现场扩展指令，不能触发 RI 异常。
+    // opcode 111000/110000 是合法的现场扩展指令，不能触发 RI 异常。
     val inst_valid      =   (alu_s =/= AluOp.NOP) || (ls_s =/= LsOp.NOP) || (mdu_s =/= MduOp.NOP) || (br_t =/= BrType.NOP) || 
-                            is_syscall || is_break || is_ertn || is_idle || is_preld || is_barrier || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop || is_rrwinz
+                            is_syscall || is_break || is_ertn || is_idle || is_preld || is_barrier || is_csr || is_rdtime_base || is_cpucfg || is_tlb_inst || is_cacop || is_rrwinz || is_rriwinz
 
     io.out.hasException := !inst_valid || is_syscall || is_break
     io.out.ecode        :=  Mux(is_syscall, "h0B".U(6.W), 
