@@ -93,12 +93,13 @@ class RrwinzUnit extends Module {
             }
             is(sRotate) {
                 // 每拍写回 rd 窗口的一位；窗口之外始终保留 oldRd。
-                val unwrappedSource = indexReg + countReg
-                val sourceOffset = Mux(unwrappedSource >= rdWidthReg,
+                // 0000 0000 0000 0000 0000 0000 0000 0000
+                val unwrappedSource = indexReg + countReg // 当前遍历次数+要旋转的位数
+                val sourceOffset = Mux(unwrappedSource >= rdWidthReg, //再防止一次，遍历的时候超出去
                     unwrappedSource - rdWidthReg, unwrappedSource)
-                val sourceIndex = Cat(0.U(1.W), rdBaseReg) + sourceOffset
-                val destinationIndex = Cat(0.U(1.W), rdBaseReg) + indexReg
-                resultBits(destinationIndex(4, 0)) :=
+                val sourceIndex = Cat(0.U(1.W), rdBaseReg) + sourceOffset // 定位右移后的第一个数的源的位置
+                val destinationIndex = Cat(0.U(1.W), rdBaseReg) + indexReg // 定位右移后第一个数的目的位置
+                resultBits(destinationIndex(4, 0)) := // 注意多位宽数字要写全
                     oldRdReg(sourceIndex(4, 0))
                 when(indexReg + 1.U >= rdWidthReg) {
                     state := sDone
