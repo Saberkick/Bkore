@@ -37,9 +37,10 @@ object MduOp{
 }
 
 object BrType{
-    private val oh = new OneHotGenerator(9)
+    private val oh = new OneHotGenerator(10)
     val NOP = oh.NOP
-    val BEQ, BNE, BLT, BGE, BLTU, BGEU, JIRL, B, BL = oh.nxt
+    // Keep existing encodings stable and append the custom complex-target branch.
+    val BEQ, BNE, BLT, BGE, BLTU, BGEU, JIRL, B, BL, BMIX = oh.nxt
 }
 
 object TlbOp{

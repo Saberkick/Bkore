@@ -322,6 +322,10 @@ class DualBackend extends Module {
          exReg.lane(0).pipe.mduOp === MduOp.MOD_W ||
          exReg.lane(0).pipe.mduOp === MduOp.DIV_WU ||
          exReg.lane(0).pipe.mduOp === MduOp.MOD_WU)
+    // BMIX is serialized in ID/IS, therefore its stateful target unit always
+    // receives the older lane0 instruction.
+    val exIsBmix = exReg.valid(0) && !exReg.lane(0).pipe.hasException &&
+        exReg.lane(0).pipe.brType === BrType.BMIX
 
     // MUL and a younger simple ALU may share an EX packet.  Keep the packet
     // resident until the registered 33x33 product is available.  This removes
@@ -364,10 +368,23 @@ class DualBackend extends Module {
     val currentMduResult = Mux(exIsMul, multiplier.io.result,
         Mux(divider.io.done, liveDivResult, divResult))
 
+    val bmixTarget = Module(new BmixTargetUnit())
+    val bmixFlush = WireDefault(false.B)
+    val bmixConsume = WireDefault(false.B)
+    bmixTarget.io.enable := exIsBmix
+    bmixTarget.io.flush := bmixFlush
+    bmixTarget.io.consume := bmixConsume
+    bmixTarget.io.pc := exReg.lane(0).pipe.pc
+    bmixTarget.io.rj := exReg.lane(0).pipe.src1_value
+    bmixTarget.io.rk := exReg.lane(0).pipe.src2_value
+    // Decoder's SI16 path has already sign-extended and shifted left by two.
+    bmixTarget.io.offset := exReg.lane(0).pipe.imm
+
     val exReadyGo = !exValid ||
-        (!exIsMul && !exIsDiv) ||
+        (!exIsMul && !exIsDiv && !exIsBmix) ||
         (exIsMul && multiplier.io.done) ||
-        (exIsDiv && (divFinished || divider.io.done))
+        (exIsDiv && (divFinished || divider.io.done)) ||
+        (exIsBmix && bmixTarget.io.done)
 
     val exForwardResult = Wire(Vec(2, UInt(32.W)))
     val exAlignmentException = Wire(Vec(2, Bool()))
@@ -434,10 +451,12 @@ class DualBackend extends Module {
         branchTaken(lane) := MuxLookup(pipe.brType, false.B)(Seq(
             BrType.BEQ -> eq, BrType.BNE -> !eq, BrType.BLT -> lt,
             BrType.BGE -> !lt, BrType.BLTU -> ltu, BrType.BGEU -> !ltu,
-            BrType.JIRL -> true.B, BrType.B -> true.B, BrType.BL -> true.B
+            BrType.JIRL -> true.B, BrType.B -> true.B, BrType.BL -> true.B,
+            BrType.BMIX -> true.B
         ))
         val base = Mux(pipe.brType === BrType.JIRL, pipe.src1_value, pipe.pc)
-        branchTarget(lane) := base + pipe.imm
+        branchTarget(lane) := Mux(pipe.brType === BrType.BMIX,
+            bmixTarget.io.target, base + pipe.imm)
         val actualTaken = pipe.brType =/= BrType.NOP && branchTaken(lane)
         branchWrong(lane) := exReg.valid(lane) &&
             ((pipe.predictedTaken =/= actualTaken) ||
@@ -686,6 +705,8 @@ class DualBackend extends Module {
     val exFire = exValid && exReadyGo && m1AllowIn && !m1LateFault
     multiplierFlush := wbFlush || m1LateFault
     multiplierConsume := exIsMul && exFire
+    bmixFlush := wbFlush || m1LateFault
+    bmixConsume := exIsBmix && exFire
 
     val lane0ArchitecturalBranchEvent = exReg.valid(0) &&
         (exReg.lane(0).pipe.brType =/= BrType.NOP ||
@@ -712,11 +733,12 @@ class DualBackend extends Module {
     io.predictorUpdate.predictedHit := branchPipe.predictedHit
     io.predictorUpdate.history := branchPipe.predictedHistory
     io.predictorUpdate.isBranch := branchPipe.brType =/= BrType.NOP
-    io.predictorUpdate.isConditional :=
+        io.predictorUpdate.isConditional :=
         branchPipe.brType =/= BrType.NOP &&
         branchPipe.brType =/= BrType.JIRL &&
         branchPipe.brType =/= BrType.B &&
-        branchPipe.brType =/= BrType.BL
+        branchPipe.brType =/= BrType.BL &&
+        branchPipe.brType =/= BrType.BMIX
     io.predictorUpdate.isCall := branchPipe.brType === BrType.BL ||
         (branchPipe.brType === BrType.JIRL && branchPipe.destReg === 1.U)
     io.predictorUpdate.isReturn := branchPipe.inst === "h4c000020".U
@@ -760,7 +782,9 @@ class DualBackend extends Module {
             dec.inst_ertn || isIdle
         val privilegeViolation = csr.io.mmu_config.crmd.plv =/= 0.U &&
             isPrivileged
-        val isBranch = op6 === BitPat("b01011?") || op6 === BitPat("b0110??")
+        // Use decoded branch identity so custom branch formats also select
+        // their second register from the conventional branch rd field.
+        val isBranch = dec.brType =/= BrType.NOP
         val isCsrWrite = inst(31, 24) === "h04".U && inst(9, 5) =/= 0.U
         val readsOldRd = dec.lsOp === LsOp.LDMAXU_W
         val src1 = inst(9, 5)
@@ -821,7 +845,7 @@ class DualBackend extends Module {
         d.src2Read := dec.src2_read
         d.serializing := dec.isCsr || dec.tlbOp =/= TlbOp.NOP || dec.is_cacop ||
             dec.is_refetch || dec.inst_ertn || dec.isLL || dec.isSC ||
-            isIdle || d.hasException
+            isIdle || dec.brType === BrType.BMIX || d.hasException
     }
 
     // ---------------------------------------------------------------------
